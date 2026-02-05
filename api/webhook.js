@@ -157,55 +157,114 @@ async function resetUserPreferences(userId) {
 }
 
 // ============ GROQ RECOMMENDATION ============
-async function generateRecommendation(preferences, existingUrls = []) {
-    const groq = new Groq({ apiKey: config.groq.apiKey });
+const CURATOR_PROMPT = `# ROLE
+You are an elite reading curator—a blend of university professor, editor of "Arts & Letters Daily", and librarian with encyclopedic knowledge spanning both canonical classics and hidden gems.
 
-    const prefList = preferences.map(p => `${p.tag} (${Math.round(p.weight * 100)}%)`).join(', ');
-    const excludeList = existingUrls.slice(0, 20).join('\n');
+# USER PROFILE
+- **Weighted Interests**: [USER_INTERESTS]
+- **Intellectual Appetite**: High. Prefers complexity, nuance, original sources, and interdisciplinary synthesis.
+- **Experience Level**: Sophisticated reader who appreciates both timeless classics AND unexpected discoveries.
 
-    const prompt = `You are an elite reading curator. Search the web and recommend 2-3 exceptional essays or articles.
+# YOUR TASK
+Search the web and recommend 2-3 pieces of exceptional reading material.
 
-USER INTERESTS: ${prefList || 'Philosophy, Essays, Ideas'}
+# THE CURATOR'S COMPASS: Balance & Depth
 
-ALREADY RECOMMENDED (avoid these): 
-${excludeList || 'None'}
+Your recommendations should reflect the FULL SPECTRUM of great writing:
 
-REQUIREMENTS:
-- Prioritize PDF links from academic sources, journals, or archives
-- Mix classic authors (Montaigne, Orwell, Didion) with hidden gems (niche blogs, preprints)
-- Return ONLY valid, accessible URLs
+## 🏛️ TIMELESS CLASSICS (Include at least one)
+The essays and works that have shaped intellectual discourse:
+- **The Great Essayists**: Montaigne, Francis Bacon, Virginia Woolf, George Orwell, Joan Didion, James Baldwin, Susan Sontag, Christopher Hitchens, David Foster Wallace, Zadie Smith
+- **Philosophical Foundations**: Seneca's letters, Marcus Aurelius, Emerson, Thoreau, William James, Bertrand Russell, Isaiah Berlin, Hannah Arendt
+- **Literary Journalism**: New Yorker longform, Paris Review interviews, Granta, Harper's deep dives
+- **Canonical Academic Papers**: Seminal works in psychology (Kahneman, Tversky), economics (Coase, Akerlof), game theory (Schelling)
 
-OUTPUT FORMAT (JSON only):
+## 💎 HIDDEN GEMS (Include at least one)
+The overlooked treasures and modern depth:
+- **Independent Thinkers**: Gwern, Scott Alexander (Astral Codex Ten), Paul Graham, Robin Hanson, Tyler Cowen
+- **Niche Journals**: Aeon, The New Atlantis, Inference Review, Works in Progress, Quillette, N+1
+- **Academic Preprints**: ArXiv, SSRN, PhilPapers, NBER working papers
+- **Forgotten Classics**: Out-of-print essays, rehabilitated ideas, historical primary sources
+
+# LINK PRIORITIES
+1. **PDFs** - Direct PDF links from academic sources (HIGHEST PRIORITY)
+2. **Open Access** - Fully accessible without login
+3. **Soft Paywall** - Acceptable if content is exceptional
+
+# AVOID THESE URLs (User has read them):
+[EXISTING_URLS]
+
+# OUTPUT FORMAT
+Respond with ONLY a JSON object:
 {
   "recommendations": [
     {
-      "title": "Article Title",
-      "author": "Author Name",
-      "url": "https://...",
-      "description": "2-3 sentence summary",
-      "reason": "Why this matches user interests",
+      "title": "Title of article/essay",
+      "author": "Author name",
+      "url": "Direct URL (prefer PDF)",
+      "description": "2-3 sentence summary of the key insight",
+      "reason": "Why this matches user interests + why it's worth reading",
       "tags": ["Tag1", "Tag2"],
       "is_pdf": true/false,
       "category": "classic" or "gem"
     }
   ]
-}`;
+}
 
-    const response = await groq.chat.completions.create({
-        model: 'compound-beta',
-        messages: [{ role: 'user', content: prompt }],
-    });
+Provide 2-3 recommendations with mix of classics and gems. Make at least one a PDF if possible.`;
 
-    const content = response.choices[0]?.message?.content || '';
-    const jsonMatch = content.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) throw new Error('No JSON in response');
+async function generateRecommendation(preferences, existingUrls = []) {
+    const groq = new Groq({ apiKey: config.groq.apiKey });
 
-    const parsed = JSON.parse(jsonMatch[0]);
-    const recs = parsed.recommendations || [parsed];
+    const topInterests = preferences
+        .sort((a, b) => b.weight - a.weight)
+        .slice(0, 5)
+        .map(w => `${w.tag} (${Math.round(w.weight)})%`)
+        .join(', ') || 'Philosophy, Psychology, Economics, History, Essays';
 
-    const primary = recs[0];
-    primary.alternatives = recs.slice(1);
-    return primary;
+    const existingList = existingUrls.length > 0
+        ? existingUrls.slice(0, 20).map(url => `- ${url}`).join('\n')
+        : '(None yet)';
+
+    const prompt = CURATOR_PROMPT
+        .replace('[USER_INTERESTS]', topInterests)
+        .replace('[EXISTING_URLS]', existingList);
+
+    console.log(`🧠 Generating recommendations for: ${topInterests}`);
+
+    try {
+        const response = await groq.chat.completions.create({
+            model: 'groq/compound-mini', // Better for rate limits
+            messages: [{ role: 'user', content: prompt }],
+        });
+
+        const content = response.choices[0]?.message?.content || '';
+
+        // Robust JSON parsing
+        const jsonMatch = content.match(/\{[\s\S]*\}/);
+        if (!jsonMatch) {
+            console.error('Groq Response Content:', content);
+            throw new Error('No JSON found in Groq response');
+        }
+
+        const parsed = JSON.parse(jsonMatch[0]);
+        const recs = parsed.recommendations || (Array.isArray(parsed) ? parsed : [parsed]);
+
+        if (!recs || recs.length === 0) throw new Error('No recommendations found');
+
+        // Sort: PDFs first
+        recs.sort((a, b) => (a.is_pdf === b.is_pdf) ? 0 : a.is_pdf ? -1 : 1);
+
+        const primary = recs[0];
+        primary.alternatives = recs.slice(1);
+
+        if (!primary.url || !primary.title) throw new Error('Invalid recommendation structure');
+
+        return primary;
+    } catch (error) {
+        console.error('Groq Generation Error:', error);
+        throw error; // Re-throw to be caught by caller
+    }
 }
 
 // ============ LINK VERIFIER ============
