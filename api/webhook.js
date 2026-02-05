@@ -3,6 +3,10 @@ import TelegramBot from 'node-telegram-bot-api';
 import { createClient } from '@supabase/supabase-js';
 import Groq from 'groq-sdk';
 import axios from 'axios';
+import * as cheerio from 'cheerio';
+import { createRequire } from 'module';
+const require = createRequire(import.meta.url);
+const pdf = require('pdf-parse');
 
 // ============ CONFIGURATION ============
 const config = {
@@ -277,15 +281,64 @@ async function generateRecommendation(preferences, existingUrls = []) {
 }
 
 // ============ LINK VERIFIER ============
-async function verifyLink(url) {
+async function verifyLink(url, expectedTitle = '') {
     try {
-        const resp = await axios.get(url, {
+        const response = await axios.get(url, {
             timeout: 8000,
-            maxRedirects: 5,
+            responseType: 'arraybuffer', // Get buffer for PDF/HTML
+            maxContentLength: 5 * 1024 * 1024, // 5MB limit
             headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
             validateStatus: () => true,
         });
-        return { isValid: resp.status >= 200 && resp.status < 400, status: resp.status };
+
+        if (response.status < 200 || response.status >= 400) {
+            return { isValid: false, reason: `Status ${response.status}`, status: response.status };
+        }
+
+        const contentType = (response.headers['content-type'] || '').toLowerCase();
+        let pageTitle = '';
+        let pageText = '';
+
+        try {
+            if (contentType.includes('pdf')) {
+                // PDF Check
+                const data = await pdf(response.data);
+                pageTitle = data.info?.Title || '';
+                pageText = data.text ? data.text.slice(0, 1500) : '';
+            } else {
+                // HTML Check
+                const html = response.data.toString();
+                const $ = cheerio.load(html);
+                pageTitle = $('title').text() || $('h1').first().text() || $('meta[name="title"]').attr('content') || '';
+                pageText = $('body').text().slice(0, 1000);
+            }
+        } catch (parseError) {
+            console.warn('Content parse failed:', parseError.message);
+            // If parsing fails but status is 200, we loosely accept it but flag it
+            return { isValid: true, status: 200, warning: 'Content check skipped (parse error)' };
+        }
+
+        // Verification Logic
+        if (!expectedTitle) return { isValid: true, status: response.status };
+
+        const clean = (str) => (str || '').toLowerCase().replace(/[^\w\s]/g, '');
+        const normExpected = clean(expectedTitle);
+        const normActual = clean(pageTitle + ' ' + pageText.slice(0, 200)); // Check title + start of text
+
+        // Check for keyword overlap
+        const keywords = normExpected.split(/\s+/).filter(w => w.length > 3);
+        if (keywords.length === 0) return { isValid: true, status: 200 }; // Title too short to verify
+
+        const matches = keywords.filter(w => normActual.includes(w));
+        const matchRatio = matches.length / keywords.length;
+
+        // Threshold: Must match at least 1 significant keyword if we have >1 keywords
+        if (matchRatio === 0 && keywords.length > 1) {
+            console.log(`Mismatch: Expected "${expectedTitle}" | Found "${pageTitle}"`);
+            return { isValid: false, reason: 'Content mismatch (Hallucination detected)', status: 418 }; // 418 = I'm a teapot (custom code for logic fail)
+        }
+
+        return { isValid: true, status: response.status };
     } catch (e) {
         return { isValid: false, reason: e.message };
     }
@@ -337,9 +390,13 @@ async function handleRecommend(chatId, telegramId, user) {
         const existingUrls = await getExistingUrls(user.id);
         const topPrefs = await getTopPreferences(user.id, 5);
         const article = await generateRecommendation(topPrefs, existingUrls);
-        const verification = await verifyLink(article.url);
+        const verification = await verifyLink(article.url, article.title);
 
         await bot.deleteMessage(chatId, loadingMsg.message_id);
+
+        if (!verification.isValid) {
+            throw new Error(`Link Verification Failed: ${verification.reason} (${article.url})`);
+        }
 
         const savedRec = await saveRecommendation(article);
         const verifiedEmoji = verification.isValid ? '✅' : '❓';
