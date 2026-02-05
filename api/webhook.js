@@ -366,7 +366,14 @@ async function handleRecommend(chatId, telegramId, user) {
     } catch (error) {
         console.error('Recommend error:', error);
         await bot.deleteMessage(chatId, loadingMsg.message_id).catch(() => { });
-        await bot.sendMessage(chatId, '❌ Failed to generate recommendation. Please ensure GROQ_API_KEY is set in Vercel settings.');
+        console.error('Full Error Object:', JSON.stringify(error, Object.getOwnPropertyNames(error)));
+
+        let errorMsg = '❌ Failed to generate recommendation.';
+        if (error.message.includes('JSON')) errorMsg += ' (AI Response Formatting Error)';
+        if (error.message.includes('tim')) errorMsg += ' (Timeout)';
+        errorMsg += `\n\nDebug: ${error.message.slice(0, 100)}`;
+
+        await bot.sendMessage(chatId, errorMsg);
     }
 }
 
