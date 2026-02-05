@@ -42,11 +42,14 @@ The overlooked treasures and modern depth:
 
 # LINK PRIORITIES
 1. **PDFs** - Direct PDF links from academic sources (HIGHEST PRIORITY)
-2. **Open Access** - Fully accessible without login
-3. **Soft Paywall** - Acceptable if content is exceptional
+2. **Open Access** - Fully accessible without login (Substack, Medium, Blogs)
+3. **Soft Paywall** - Acceptable if content is exceptional (New Yorker, Atlantic)
 
-# AVOID THESE URLs (User has read them):
-[EXISTING_URLS]
+# EXCLUSIONS (Do NOT Recommend)
+- **Full Books** (Amazon, Goodreads, etc.) - The user wants *articles* and *essays* to read now.
+- **Videos** (YouTube)
+- **Podcasts** (Spotify)
+- **Short News** (Reuters, AP) - User wants *analysis* and *depth*.
 
 # OUTPUT FORMAT
 Respond with ONLY a JSON object:
@@ -65,7 +68,7 @@ Respond with ONLY a JSON object:
   ]
 }
 
-Provide 2-3 recommendations with mix of classics and gems. Make at least one a PDF if possible.`;
+Provide 2-3 recommendations with mix of classics and gems. Make at least one a PDF if possible. Ensure they are ARTICLES or ESSAYS, not books.`;
 
 /**
  * Parse recommendations from Groq response

@@ -194,11 +194,14 @@ The overlooked treasures and modern depth:
 
 # LINK PRIORITIES
 1. **PDFs** - Direct PDF links from academic sources (HIGHEST PRIORITY)
-2. **Open Access** - Fully accessible without login
-3. **Soft Paywall** - Acceptable if content is exceptional
+2. **Open Access** - Fully accessible without login (Substack, Medium, Blogs)
+3. **Soft Paywall** - Acceptable if content is exceptional (New Yorker, Atlantic)
 
-# AVOID THESE URLs (User has read them):
-[EXISTING_URLS]
+# EXCLUSIONS (Do NOT Recommend)
+- **Full Books** (Amazon, Goodreads, etc.) - The user wants *articles* and *essays* to read now.
+- **Videos** (YouTube)
+- **Podcasts** (Spotify)
+- **Short News** (Reuters, AP) - User wants *analysis* and *depth*.
 
 # OUTPUT FORMAT
 Respond with ONLY a JSON object:
@@ -217,7 +220,7 @@ Respond with ONLY a JSON object:
   ]
 }
 
-Provide 2-3 recommendations with mix of classics and gems. Make at least one a PDF if possible.`;
+Provide 2-3 recommendations with mix of classics and gems. Make at least one a PDF if possible. Ensure they are ARTICLES or ESSAYS, not books.`;
 
 async function generateRecommendation(preferences, existingUrls = []) {
     const groq = new Groq({ apiKey: config.groq.apiKey });
@@ -225,18 +228,18 @@ async function generateRecommendation(preferences, existingUrls = []) {
     const topInterests = preferences
         .sort((a, b) => b.weight - a.weight)
         .slice(0, 5)
-        .map(w => `${w.tag} (${Math.round(w.weight)})%`)
+        .map(w => `${w.tag} (${Math.round(w.weight)})% `)
         .join(', ') || 'Philosophy, Psychology, Economics, History, Essays';
 
     const existingList = existingUrls.length > 0
-        ? existingUrls.slice(0, 20).map(url => `- ${url}`).join('\n')
+        ? existingUrls.slice(0, 20).map(url => `- ${url} `).join('\n')
         : '(None yet)';
 
     const prompt = CURATOR_PROMPT
         .replace('[USER_INTERESTS]', topInterests)
         .replace('[EXISTING_URLS]', existingList);
 
-    console.log(`🧠 Generating recommendations for: ${topInterests}`);
+    console.log(`🧠 Generating recommendations for: ${topInterests} `);
 
     try {
         const response = await groq.chat.completions.create({
@@ -292,18 +295,18 @@ async function verifyLink(url) {
 async function handleStart(chatId, telegramId, username) {
     await createUser(telegramId, username, telegramId === config.telegram.ownerId);
 
-    const message = `📚 **Welcome to Essai!**
+    const message = `📚 ** Welcome to Essai! **
 
-I'm your personal reading curator. I find intellectually stimulating essays, papers, and articles tailored to your interests.
+    I'm your personal reading curator. I find intellectually stimulating essays, papers, and articles tailored to your interests.
 
-**Commands:**
+        ** Commands:**
 • /recommend - Get a reading recommendation
 • /preferences - See your taste profile
 • /settag \`tag\` \`weight\` - Set a tag weight (0-100)
 • /addtag \`tag\` - Add new interest
 • /removetag \`tag\` - Remove a tag
 • /resettaste - Reset all preferences
-• /pause / /resume - Toggle scheduled pushes
+• /pause / / resume - Toggle scheduled pushes
 • /help - Show this list again
 
 Start with /preferences to see your interests, then /recommend!`;
@@ -313,7 +316,7 @@ Start with /preferences to see your interests, then /recommend!`;
 
 async function handleHelp(chatId) {
     const message = `
-**Available Commands:**
+** Available Commands:**
 
 • /recommend - Get a reading recommendation
 • /preferences - See your taste profile
@@ -341,14 +344,14 @@ async function handleRecommend(chatId, telegramId, user) {
         const savedRec = await saveRecommendation(article);
         const verifiedEmoji = verification.isValid ? '✅' : '❓';
         const categoryEmoji = article.category === 'classic' ? '🏛️' : '💎';
-        const tags = (article.tags || []).map(t => `#${t.replace(/\s+/g, '')}`).join(' ');
+        const tags = (article.tags || []).map(t => `#${t.replace(/\s+/g, '')} `).join(' ');
 
-        let message = `${categoryEmoji} **${article.title}**\n*by ${article.author}*\n\n${article.description}\n\n💡 **Why this?** ${article.reason}\n\n${tags}\n\n🔗 [Read](${article.url}) ${verifiedEmoji}`;
+        let message = `${categoryEmoji} ** ${article.title}**\n * by ${article.author}*\n\n${article.description} \n\n💡 ** Why this ?** ${article.reason} \n\n${tags} \n\n🔗[Read](${article.url}) ${verifiedEmoji} `;
 
         if (article.alternatives?.length > 0) {
-            message += `\n\n📚 **Alternatives:**`;
+            message += `\n\n📚 ** Alternatives:** `;
             article.alternatives.forEach(r => {
-                message += `\n• [${r.title}](${r.url}) - _${r.author}_`;
+                message += `\n•[${r.title}](${r.url}) - _${r.author} _`;
             });
         }
 
@@ -357,13 +360,13 @@ async function handleRecommend(chatId, telegramId, user) {
             reply_markup: {
                 inline_keyboard: [
                     [
-                        { text: '⭐1', callback_data: `rate:${savedRec.id}:1` },
-                        { text: '⭐2', callback_data: `rate:${savedRec.id}:2` },
-                        { text: '⭐3', callback_data: `rate:${savedRec.id}:3` },
-                        { text: '⭐4', callback_data: `rate:${savedRec.id}:4` },
-                        { text: '⭐5', callback_data: `rate:${savedRec.id}:5` },
+                        { text: '⭐1', callback_data: `rate:${savedRec.id}: 1` },
+                        { text: '⭐2', callback_data: `rate:${savedRec.id}: 2` },
+                        { text: '⭐3', callback_data: `rate:${savedRec.id}: 3` },
+                        { text: '⭐4', callback_data: `rate:${savedRec.id}: 4` },
+                        { text: '⭐5', callback_data: `rate:${savedRec.id}: 5` },
                     ],
-                    [{ text: '🎲 Recommend Something Else', callback_data: `rate:${savedRec.id}:0:reroll` }]
+                    [{ text: '🎲 Recommend Something Else', callback_data: `rate:${savedRec.id}: 0: reroll` }]
                 ]
             }
         });
@@ -377,7 +380,7 @@ async function handleRecommend(chatId, telegramId, user) {
         let errorMsg = '❌ Failed to generate recommendation.';
         if (error.message.includes('JSON')) errorMsg += ' (AI Response Formatting Error)';
         if (error.message.includes('tim')) errorMsg += ' (Timeout)';
-        errorMsg += `\n\nDebug: ${error.message.slice(0, 100)}`;
+        errorMsg += `\n\nDebug: ${error.message.slice(0, 100)} `;
 
         await bot.sendMessage(chatId, errorMsg);
     }
@@ -389,8 +392,8 @@ async function handlePreferences(chatId, userId) {
         await bot.sendMessage(chatId, '📊 No preferences yet. Rate some articles!');
         return;
     }
-    const list = prefs.map(p => `• ${p.tag}: ${Math.round(p.weight * 100)}%`).join('\n');
-    await bot.sendMessage(chatId, `📊 **Your Taste Profile:**\n\n${list}`, { parse_mode: 'Markdown' });
+    const list = prefs.map(p => `• ${p.tag}: ${Math.round(p.weight * 100)}% `).join('\n');
+    await bot.sendMessage(chatId, `📊 ** Your Taste Profile:**\n\n${list} `, { parse_mode: 'Markdown' });
 }
 
 async function handleSetTag(chatId, userId, args) {
@@ -406,19 +409,19 @@ async function handleSetTag(chatId, userId, args) {
     if (isNaN(weight) || weight < 0 || weight > 100) return bot.sendMessage(chatId, '⚠️ Weight must be 0-100');
 
     await setUserPreference(userId, tag, weight);
-    await bot.sendMessage(chatId, `✅ Set **${tag}** to ${weight}%`, { parse_mode: 'Markdown' });
+    await bot.sendMessage(chatId, `✅ Set ** ${tag}** to ${weight}% `, { parse_mode: 'Markdown' });
 }
 
 async function handleAddTag(chatId, userId, tag) {
     if (!tag) return bot.sendMessage(chatId, '⚠️ Usage: /addtag <Tag Name>');
     await setUserPreference(userId, tag, 50);
-    await bot.sendMessage(chatId, `✅ Added interest: **${tag}**`, { parse_mode: 'Markdown' });
+    await bot.sendMessage(chatId, `✅ Added interest: ** ${tag}** `, { parse_mode: 'Markdown' });
 }
 
 async function handleRemoveTag(chatId, userId, tag) {
     if (!tag) return bot.sendMessage(chatId, '⚠️ Usage: /removetag <Tag Name>');
     await removeUserPreference(userId, tag);
-    await bot.sendMessage(chatId, `🗑️ Removed interest: **${tag}**`, { parse_mode: 'Markdown' });
+    await bot.sendMessage(chatId, `🗑️ Removed interest: ** ${tag}** `, { parse_mode: 'Markdown' });
 }
 
 async function handleResetTaste(chatId, userId) {
@@ -439,7 +442,7 @@ async function handleResume(chatId, telegramId) {
 async function handleDebug(chatId, telegramId) {
     const user = await getUser(telegramId);
     const status = user ? user.status : 'Unknown';
-    await bot.sendMessage(chatId, `🔧 **Debug Info**\n\n• User ID: \`${telegramId}\`\n• Status: ${status}\n• Mode: Serverless (Vercel)`, { parse_mode: 'Markdown' });
+    await bot.sendMessage(chatId, `🔧 ** Debug Info **\n\n• User ID: \`${telegramId}\`\n• Status: ${status}\n• Mode: Serverless (Vercel)`, { parse_mode: 'Markdown' });
 }
 
 

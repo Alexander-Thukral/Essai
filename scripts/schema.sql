@@ -18,7 +18,7 @@ CREATE TABLE IF NOT EXISTS recommendations (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     title TEXT NOT NULL,
     author TEXT,
-    url TEXT NOT NULL,
+    url TEXT UNIQUE NOT NULL,
     description TEXT,
     reason TEXT,
     tags TEXT[],
