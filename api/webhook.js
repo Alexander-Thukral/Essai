@@ -43,7 +43,10 @@ async function createUser(telegramId, username, isAdmin = false) {
         .upsert({ telegram_id: telegramId, telegram_username: username, status }, { onConflict: 'telegram_id' })
         .select()
         .single();
-    if (error) console.error('createUser error:', error);
+    if (error) {
+        console.error('createUser error:', error);
+        throw new Error(`DB Error (createUser): ${error.message}`);
+    }
     return data;
 }
 
@@ -95,7 +98,10 @@ async function saveRecommendation(article) {
         }, { onConflict: 'url' })
         .select()
         .single();
-    if (error) console.error('saveRecommendation error:', error);
+    if (error) {
+        console.error('saveRecommendation error:', error);
+        throw new Error(`DB Error (saveRecommendation): ${error.message}`);
+    }
     return data;
 }
 
