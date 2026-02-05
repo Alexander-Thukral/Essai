@@ -118,6 +118,44 @@ async function updateRating(userId, recId, rating) {
     return data;
 }
 
+async function updateUserScheduleStatus(telegramId, receiveScheduled) {
+    const { error } = await supabase
+        .from('users')
+        .update({ receive_scheduled: receiveScheduled })
+        .eq('telegram_id', telegramId);
+    if (error) console.error('updateUserScheduleStatus error:', error);
+}
+
+async function setUserPreference(userId, tag, weight) {
+    const clampedWeight = Math.max(0, Math.min(100, weight));
+    const { error } = await supabase
+        .from('user_preferences')
+        .upsert({
+            user_id: userId,
+            tag,
+            weight: clampedWeight,
+            sample_count: 1,
+        }, { onConflict: 'user_id,tag' });
+    if (error) console.error('setUserPreference error:', error);
+}
+
+async function removeUserPreference(userId, tag) {
+    const { error } = await supabase
+        .from('user_preferences')
+        .delete()
+        .eq('user_id', userId)
+        .ilike('tag', tag);
+    if (error) console.error('removeUserPreference error:', error);
+}
+
+async function resetUserPreferences(userId) {
+    const { error } = await supabase
+        .from('user_preferences')
+        .delete()
+        .eq('user_id', userId);
+    if (error) console.error('resetUserPreferences error:', error);
+}
+
 // ============ GROQ RECOMMENDATION ============
 async function generateRecommendation(preferences, existingUrls = []) {
     const groq = new Groq({ apiKey: config.groq.apiKey });
@@ -188,7 +226,40 @@ async function verifyLink(url) {
 // ============ COMMAND HANDLERS ============
 async function handleStart(chatId, telegramId, username) {
     await createUser(telegramId, username, telegramId === config.telegram.ownerId);
-    await bot.sendMessage(chatId, `📚 **Welcome to Essai!**\n\nI'm your personal reading curator.\n\nCommands:\n• /recommend - Get a reading recommendation\n• /preferences - See your taste profile`, { parse_mode: 'Markdown' });
+
+    const message = `📚 **Welcome to Essai!**
+
+I'm your personal reading curator. I find intellectually stimulating essays, papers, and articles tailored to your interests.
+
+**Commands:**
+• /recommend - Get a reading recommendation
+• /preferences - See your taste profile
+• /settag \`tag\` \`weight\` - Set a tag weight (0-100)
+• /addtag \`tag\` - Add new interest
+• /removetag \`tag\` - Remove a tag
+• /resettaste - Reset all preferences
+• /pause / /resume - Toggle scheduled pushes
+• /help - Show this list again
+
+Start with /preferences to see your interests, then /recommend!`;
+
+    await bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
+}
+
+async function handleHelp(chatId) {
+    const message = `
+**Available Commands:**
+
+• /recommend - Get a reading recommendation
+• /preferences - See your taste profile
+• /settag <tag> <weight> - Set a tag weight (0-100)
+• /addtag <tag> - Add new interest (default 50%)
+• /removetag <tag> - Remove a tag
+• /resettaste - Reset all preferences
+• /pause - Pause scheduled recommendations
+• /resume - Resume scheduled recommendations
+`;
+    await bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
 }
 
 async function handleRecommend(chatId, telegramId, user) {
@@ -236,7 +307,7 @@ async function handleRecommend(chatId, telegramId, user) {
     } catch (error) {
         console.error('Recommend error:', error);
         await bot.deleteMessage(chatId, loadingMsg.message_id).catch(() => { });
-        await bot.sendMessage(chatId, '❌ Failed to generate recommendation. Please try again.');
+        await bot.sendMessage(chatId, '❌ Failed to generate recommendation. Please ensure GROQ_API_KEY is set in Vercel settings.');
     }
 }
 
@@ -250,12 +321,69 @@ async function handlePreferences(chatId, userId) {
     await bot.sendMessage(chatId, `📊 **Your Taste Profile:**\n\n${list}`, { parse_mode: 'Markdown' });
 }
 
+async function handleSetTag(chatId, userId, args) {
+    if (!args) return bot.sendMessage(chatId, '⚠️ Usage: /settag <Tag Name> <Weight>');
+
+    // Split on last space to get weight
+    const lastSpaceIndex = args.lastIndexOf(' ');
+    if (lastSpaceIndex === -1) return bot.sendMessage(chatId, '⚠️ Usage: /settag <Tag Name> <Weight>');
+
+    const tag = args.substring(0, lastSpaceIndex).trim();
+    const weight = parseInt(args.substring(lastSpaceIndex + 1), 10);
+
+    if (isNaN(weight) || weight < 0 || weight > 100) return bot.sendMessage(chatId, '⚠️ Weight must be 0-100');
+
+    await setUserPreference(userId, tag, weight);
+    await bot.sendMessage(chatId, `✅ Set **${tag}** to ${weight}%`, { parse_mode: 'Markdown' });
+}
+
+async function handleAddTag(chatId, userId, tag) {
+    if (!tag) return bot.sendMessage(chatId, '⚠️ Usage: /addtag <Tag Name>');
+    await setUserPreference(userId, tag, 50);
+    await bot.sendMessage(chatId, `✅ Added interest: **${tag}**`, { parse_mode: 'Markdown' });
+}
+
+async function handleRemoveTag(chatId, userId, tag) {
+    if (!tag) return bot.sendMessage(chatId, '⚠️ Usage: /removetag <Tag Name>');
+    await removeUserPreference(userId, tag);
+    await bot.sendMessage(chatId, `🗑️ Removed interest: **${tag}**`, { parse_mode: 'Markdown' });
+}
+
+async function handleResetTaste(chatId, userId) {
+    await resetUserPreferences(userId);
+    await bot.sendMessage(chatId, '🔄 Taste profile reset to defaults.');
+}
+
+async function handlePause(chatId, telegramId) {
+    await updateUserScheduleStatus(telegramId, false);
+    await bot.sendMessage(chatId, '⏸️ Scheduled recommendations paused.');
+}
+
+async function handleResume(chatId, telegramId) {
+    await updateUserScheduleStatus(telegramId, true);
+    await bot.sendMessage(chatId, '▶️ Scheduled recommendations resumed!');
+}
+
+async function handleDebug(chatId, telegramId) {
+    const user = await getUser(telegramId);
+    const status = user ? user.status : 'Unknown';
+    await bot.sendMessage(chatId, `🔧 **Debug Info**\n\n• User ID: \`${telegramId}\`\n• Status: ${status}\n• Mode: Serverless (Vercel)`, { parse_mode: 'Markdown' });
+}
+
+
 // ============ ACCESS CONTROL ============
 async function processMessage(msg) {
     const chatId = msg.chat.id;
     const telegramId = msg.from.id;
     const username = msg.from.username || msg.from.first_name;
     const text = msg.text || '';
+
+    // Parse command and args
+    const match = text.match(/^\/(\w+)(?:\s+(.+))?$/);
+    if (!match) return; // Not a command
+
+    const command = match[1];
+    const args = match[2];
 
     let user = await getUser(telegramId);
     const isAdmin = telegramId === config.telegram.ownerId;
@@ -264,10 +392,9 @@ async function processMessage(msg) {
         user = await createUser(telegramId, username, isAdmin);
     }
 
-    // Commands that don't need approval
-    if (text.startsWith('/start')) {
-        return handleStart(chatId, telegramId, username);
-    }
+    // Public Commands
+    if (command === 'start') return handleStart(chatId, telegramId, username);
+    if (command === 'help') return handleHelp(chatId);
 
     // Check access
     if (!isAdmin && user.status === 'blocked') {
@@ -290,12 +417,18 @@ async function processMessage(msg) {
         return;
     }
 
-    // Approved users
-    if (text.startsWith('/recommend')) {
-        return handleRecommend(chatId, telegramId, user);
-    }
-    if (text.startsWith('/preferences')) {
-        return handlePreferences(chatId, user.id);
+    // Approved User Commands
+    switch (command) {
+        case 'recommend': return handleRecommend(chatId, telegramId, user);
+        case 'preferences': return handlePreferences(chatId, user.id);
+        case 'settag': return handleSetTag(chatId, user.id, args);
+        case 'addtag': return handleAddTag(chatId, user.id, args);
+        case 'removetag': return handleRemoveTag(chatId, user.id, args);
+        case 'resettaste': return handleResetTaste(chatId, user.id);
+        case 'pause': return handlePause(chatId, telegramId);
+        case 'resume': return handleResume(chatId, telegramId);
+        case 'debug': return handleDebug(chatId, telegramId);
+        default: break; // Unknown command
     }
 }
 
