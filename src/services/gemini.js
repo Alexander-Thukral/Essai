@@ -68,7 +68,7 @@ Respond with ONLY a JSON object:
   ]
 }
 
-Provide 2-3 recommendations with mix of classics and gems. Make at least one a PDF if possible. Ensure they are ARTICLES or ESSAYS, not books.`;
+Provide 2-3 recommendations. LEAN SLIGHTLY towards 'Hidden Gems' (e.g. 2 Gems, 1 Classic), but keep a mix. Make at least one a PDF if possible. Ensure they are ARTICLES or ESSAYS, not books.`;
 
 /**
  * Parse recommendations from Groq response
