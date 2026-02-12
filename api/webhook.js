@@ -37,10 +37,15 @@ async function getUser(telegramId) {
 }
 
 async function createUser(telegramId, username, isAdmin = false) {
+    // First check if user already exists — DON'T overwrite their status
+    const existing = await getUser(telegramId);
+    if (existing) return existing;
+
+    // Only set pending/approved for NEW users
     const status = isAdmin ? 'approved' : 'pending';
     const { data, error } = await supabase
         .from('users')
-        .upsert({ telegram_id: telegramId, telegram_username: username, status }, { onConflict: 'telegram_id' })
+        .insert({ telegram_id: telegramId, telegram_username: username, status })
         .select()
         .single();
     if (error) {
@@ -441,22 +446,26 @@ async function verifyLink(url, expectedTitle = '') {
 
 // ============ COMMAND HANDLERS ============
 async function handleStart(chatId, telegramId, username) {
-    const user = await createUser(telegramId, username, telegramId === config.telegram.ownerId);
+    // Get existing user or create new one — NEVER overwrite status
+    let user = await getUser(telegramId);
+    if (!user) {
+        user = await createUser(telegramId, username, telegramId === config.telegram.ownerId);
+    }
 
     // Initialize default preferences if new user
     const defaultTags = ['Psychology', 'Philosophy', 'Economics', 'Physics', 'History', 'Essays', 'Game Theory', 'Biology', 'Sociology', 'Mathematics', 'Computer Science', 'Geopolitics'];
-    let prefs = await getTopPreferences(user.id, 12);
+    let prefs = await getTopPreferences(user.id, 100);
     if (!prefs.length) {
         for (const tag of defaultTags) await setUserPreference(user.id, tag, 50);
-        prefs = await getTopPreferences(user.id, 12);
+        prefs = await getTopPreferences(user.id, 100);
     }
 
-    // Format preference bars for display
+    // Format preference bars for display (show ALL preferences)
     const getBar = (w) => {
         const clamped = Math.max(0, Math.min(100, Math.round(w)));
         return '█'.repeat(Math.round(clamped / 10)) + '░'.repeat(10 - Math.round(clamped / 10));
     };
-    const prefList = prefs.slice(0, 7).map((p, i) => {
+    const prefList = prefs.map((p, i) => {
         const w = Math.max(0, Math.min(100, Math.round(p.weight)));
         return `${i + 1}. **${p.tag}** ${getBar(w)} ${w}%`;
     }).join('\n');
@@ -602,11 +611,11 @@ async function handleRecommend(chatId, telegramId, user) {
 }
 
 async function handlePreferences(chatId, userId) {
-    let prefs = await getTopPreferences(userId, 12);
+    let prefs = await getTopPreferences(userId, 100);
     if (!prefs.length) {
         const defaults = ['Psychology', 'Philosophy', 'Economics', 'Physics', 'History', 'Essays', 'Game Theory', 'Biology', 'Sociology', 'Mathematics', 'Computer Science', 'Geopolitics'];
         for (const tag of defaults) await setUserPreference(userId, tag, 50);
-        prefs = await getTopPreferences(userId, 12);
+        prefs = await getTopPreferences(userId, 100);
     }
     const getBar = (w) => {
         const clamped = Math.max(0, Math.min(100, Math.round(w)));
@@ -734,7 +743,7 @@ async function processCallback(query) {
         await approveUser(targetId);
         await bot.answerCallbackQuery(query.id, { text: 'User approved!' });
         await bot.editMessageText(`✅ Approved user ${targetId}`, { chat_id: chatId, message_id: messageId });
-        await bot.sendMessage(targetId, '🎉 **Access Granted!**\n\nTap /start to begin.', { parse_mode: 'Markdown' });
+        await bot.sendMessage(targetId, '🎉 **Access Granted!**\n\nYou can now use all commands. Try /recommend to get your first article!', { parse_mode: 'Markdown' });
         return;
     }
 

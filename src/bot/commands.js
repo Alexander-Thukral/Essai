@@ -23,14 +23,14 @@ export async function handleStart(bot, msg) {
     const user = await getUser(telegramId) || await createUser(telegramId, username, false);
 
     // Initialize default preferences if new user
-    let prefs = await getTopPreferences(user.id, 12);
+    let prefs = await getTopPreferences(user.id, 100);
     if (!prefs.length) {
         await initializeDefaultTags(user.id);
-        prefs = await getTopPreferences(user.id, 12);
+        prefs = await getTopPreferences(user.id, 100);
     }
 
-    // Format preference bars for display
-    const prefDisplay = formatPreferences(prefs.slice(0, 7));
+    // Format preference bars for display (show ALL)
+    const prefDisplay = formatPreferences(prefs);
 
     const message = `📚 **Welcome to Essai!**
 
@@ -172,10 +172,10 @@ export async function handlePreferences(bot, msg) {
     const user = await getUser(telegramId);
     if (!user) return bot.sendMessage(chatId, '❌ Please /start first');
 
-    let prefs = await getTopPreferences(user.id, 12);
+    let prefs = await getTopPreferences(user.id, 100);
     if (!prefs.length) {
         await initializeDefaultTags(user.id);
-        prefs = await getTopPreferences(user.id, 12);
+        prefs = await getTopPreferences(user.id, 100);
     }
     const display = formatPreferences(prefs);
     await bot.sendMessage(chatId, `📊 **Your Interests:**\n\n${display}\n\n_Weights adjust as you rate recommendations ⭐1-5_\n_Use /addtag, /removetag, /settag to customize_`, { parse_mode: 'Markdown' });

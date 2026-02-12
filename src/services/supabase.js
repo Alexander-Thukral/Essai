@@ -9,16 +9,19 @@ export const supabase = createClient(config.supabase.url, config.supabase.anonKe
  * Create or get user. New users are 'pending' if ownerId is set.
  */
 export async function createUser(telegramId, username, isAdmin = false) {
+    // Check if user already exists — DON'T overwrite their status
+    const existing = await getUser(telegramId);
+    if (existing) return existing;
+
+    // Only set pending/approved for NEW users
     const status = isAdmin ? 'approved' : 'pending';
 
     const { data, error } = await supabase
         .from('users')
-        .upsert({
+        .insert({
             telegram_id: telegramId,
             telegram_username: username,
             status: status
-        }, {
-            onConflict: 'telegram_id'
         })
         .select()
         .single();
