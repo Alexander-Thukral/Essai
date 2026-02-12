@@ -36,6 +36,10 @@ Recommend exactly 3 pieces of exceptional reading material (essays, articles, pa
 - Do NOT recommend books, videos, podcasts, or short news
 - Each recommendation MUST be a specific, real, existing article or essay — not something you invented
 - Include the publication/website where this was originally published
+- Do NOT recommend any of the articles in the ALREADY READ list below — those have already been sent
+- Prioritize VARIETY — try uncommon, surprising, or less-obvious picks
+
+[ALREADY_READ]
 
 # OUTPUT FORMAT
 Respond with ONLY this JSON (no markdown, no backticks):
@@ -101,20 +105,26 @@ async function curateIdeas(preferences, existingTitles = []) {
         .map(w => `${w.tag} (${Math.round(w.weight)}%)`)
         .join(', ') || 'Philosophy, Psychology, Economics, History, Essays';
 
-    const avoidSection = existingTitles.length > 0
-        ? `\n\n# ALREADY RECOMMENDED (avoid these)\n${existingTitles.slice(0, 15).map(t => `- ${t}`).join('\n')}`
-        : '';
+    // Build exclusion list from previously recommended titles
+    let alreadyReadSection = '';
+    if (existingTitles.length > 0) {
+        const titleList = existingTitles.slice(0, 30).map(t => `- "${t}"`).join('\n');
+        alreadyReadSection = `\n# ALREADY READ (do NOT recommend these again):\n${titleList}`;
+    } else {
+        alreadyReadSection = '\n# ALREADY READ: None yet — this is their first recommendation!';
+    }
 
     const prompt = CURATION_PROMPT
-        .replace('[USER_INTERESTS]', topInterests) + avoidSection;
+        .replace('[USER_INTERESTS]', topInterests)
+        .replace('[ALREADY_READ]', alreadyReadSection);
 
-    console.log(`🧠 Step 1: Curating ideas for: ${topInterests}`);
+    console.log(`🧠 Step 1: Curating ideas for: ${topInterests} (excluding ${existingTitles.length} already read)`);
 
     const response = await retryWithBackoff(async () => {
         return await groq.chat.completions.create({
             model: 'llama-3.3-70b-versatile',
             messages: [{ role: 'user', content: prompt }],
-            temperature: 0.7,
+            temperature: 0.9,
             max_tokens: 2000,
         });
     });
@@ -208,9 +218,9 @@ async function findUrlsForIdeas(ideas) {
  * @param {string[]} existingUrls - URLs to avoid (used for title dedup)
  * @returns {Promise<Object>} Primary article with alternatives array
  */
-export async function generateRecommendation(preferences, existingUrls = []) {
+export async function generateRecommendation(preferences, existingUrls = [], existingTitles = []) {
     // Step 1: Curate ideas (fast, free, no URLs)
-    const ideas = await curateIdeas(preferences, existingUrls);
+    const ideas = await curateIdeas(preferences, existingTitles);
 
     if (!ideas.length) {
         throw new Error('No ideas generated in Step 1');
@@ -221,14 +231,32 @@ export async function generateRecommendation(preferences, existingUrls = []) {
         console.log(`  ${i + 1}. "${idea.title}" by ${idea.author} [${idea.category}]`);
     });
 
-    // Step 2: Find real URLs (parallel, uses web search)
-    const { articlesWithUrls, articlesWithoutUrls } = await findUrlsForIdeas(ideas);
+    // Filter out any ideas that match existing titles (safety net)
+    const existingTitleSet = new Set(existingTitles.map(t => t.toLowerCase().trim()));
+    const freshIdeas = ideas.filter(idea => {
+        const titleLower = idea.title?.toLowerCase().trim();
+        if (existingTitleSet.has(titleLower)) {
+            console.log(`  ⏭️ Skipping duplicate: "${idea.title}"`);
+            return false;
+        }
+        return true;
+    });
+    const ideasToUse = freshIdeas.length > 0 ? freshIdeas : ideas;
 
-    // Combine: verified URLs first, then search fallbacks
-    const allArticles = [...articlesWithUrls, ...articlesWithoutUrls];
+    // Step 2: Find real URLs (parallel, uses web search)
+    const { articlesWithUrls, articlesWithoutUrls } = await findUrlsForIdeas(ideasToUse);
+
+    // Filter out duplicate URLs
+    const allArticles = [...articlesWithUrls, ...articlesWithoutUrls].filter(a => {
+        if (existingUrls.includes(a.url)) {
+            console.log(`  ⏭️ Skipping duplicate URL: ${a.url}`);
+            return false;
+        }
+        return true;
+    });
 
     if (allArticles.length === 0) {
-        throw new Error('Failed to process any recommendations');
+        throw new Error('No articles found after deduplication');
     }
 
     // Primary is the first article with a real URL, or first fallback

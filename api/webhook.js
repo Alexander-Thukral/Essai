@@ -91,6 +91,15 @@ async function getExistingUrls(userId) {
     return data?.map(r => r.recommendations?.url).filter(Boolean) || [];
 }
 
+async function getExistingTitles(userId) {
+    const { data, error } = await supabase
+        .from('user_recommendations')
+        .select('recommendations(title)')
+        .eq('user_id', userId);
+    if (error) return [];
+    return data?.map(r => r.recommendations?.title).filter(Boolean) || [];
+}
+
 async function saveRecommendation(article) {
     const { data, error } = await supabase
         .from('recommendations')
@@ -229,6 +238,10 @@ Recommend exactly 3 pieces of exceptional reading material (essays, articles, pa
 - Do NOT recommend books, videos, podcasts, or short news
 - Each recommendation MUST be a specific, real, existing article or essay — not something you invented
 - Include the publication/website where this was originally published
+- Do NOT recommend any of the articles in the ALREADY READ list below — those have already been sent
+- Prioritize VARIETY — try uncommon, surprising, or less-obvious picks
+
+[ALREADY_READ]
 
 # OUTPUT FORMAT
 Respond with ONLY this JSON (no markdown, no backticks):
@@ -304,21 +317,32 @@ function isValidUrl(url) {
     catch { return false; }
 }
 
-async function curateIdeas(preferences, existingUrls = []) {
+async function curateIdeas(preferences, existingTitles = []) {
     const groq = new Groq({ apiKey: config.groq.apiKey });
     const topInterests = preferences
         .sort((a, b) => b.weight - a.weight).slice(0, 5)
         .map(w => `${w.tag} (${Math.round(w.weight)}%)`).join(', ')
         || 'Philosophy, Psychology, Economics, History, Essays';
 
-    const prompt = CURATION_PROMPT.replace('[USER_INTERESTS]', topInterests);
-    console.log(`🧠 Step 1: Curating ideas for: ${topInterests}`);
+    // Build exclusion list from previously recommended titles
+    let alreadyReadSection = '';
+    if (existingTitles.length > 0) {
+        const titleList = existingTitles.slice(0, 30).map(t => `- "${t}"`).join('\n');
+        alreadyReadSection = `\n# ALREADY READ (do NOT recommend these again):\n${titleList}`;
+    } else {
+        alreadyReadSection = '\n# ALREADY READ: None yet — this is their first recommendation!';
+    }
+
+    const prompt = CURATION_PROMPT
+        .replace('[USER_INTERESTS]', topInterests)
+        .replace('[ALREADY_READ]', alreadyReadSection);
+    console.log(`🧠 Step 1: Curating ideas for: ${topInterests} (excluding ${existingTitles.length} already read)`);
 
     const response = await retryWithBackoff(() =>
         groq.chat.completions.create({
             model: 'llama-3.3-70b-versatile',
             messages: [{ role: 'user', content: prompt }],
-            temperature: 0.7, max_tokens: 2000,
+            temperature: 0.9, max_tokens: 2000,
         })
     );
 
@@ -353,25 +377,50 @@ async function findUrlForArticle(idea) {
     }
 }
 
-async function generateRecommendation(preferences, existingUrls = []) {
-    const ideas = await curateIdeas(preferences, existingUrls);
+async function generateRecommendation(preferences, existingUrls = [], existingTitles = []) {
+    const ideas = await curateIdeas(preferences, existingTitles);
     if (!ideas.length) throw new Error('No ideas generated');
     console.log(`📚 Step 1: ${ideas.length} ideas`);
 
+    // Filter out any ideas that match existing titles (safety net)
+    const existingTitleSet = new Set(existingTitles.map(t => t.toLowerCase().trim()));
+    const freshIdeas = ideas.filter(idea => {
+        const titleLower = idea.title?.toLowerCase().trim();
+        if (existingTitleSet.has(titleLower)) {
+            console.log(`  ⏭️ Skipping duplicate: "${idea.title}"`);
+            return false;
+        }
+        return true;
+    });
+
+    // Use fresh ideas if available, otherwise fall back to all ideas
+    const ideasToUse = freshIdeas.length > 0 ? freshIdeas : ideas;
+
     // Step 2: Find URLs in parallel
-    console.log(`🔍 Step 2: Finding URLs (parallel)...`);
-    const results = await Promise.allSettled(ideas.map(i => findUrlForArticle(i)));
+    console.log(`🔍 Step 2: Finding URLs for ${ideasToUse.length} articles (parallel)...`);
+    const results = await Promise.allSettled(ideasToUse.map(i => findUrlForArticle(i)));
 
     const articles = [];
     results.forEach((r, i) => {
         if (r.status === 'fulfilled' && r.value) {
-            articles.push(r.value);
+            // Skip if URL already sent to this user
+            if (!existingUrls.includes(r.value.url)) {
+                articles.push(r.value);
+            } else {
+                console.log(`  ⏭️ Skipping duplicate URL: ${r.value.url}`);
+                // Still add with search fallback
+                const idea = ideasToUse[i];
+                const q = encodeURIComponent(`${idea.title} ${idea.author} ${idea.publication || ''}`);
+                articles.push({ ...idea, url: `https://www.google.com/search?q=${q}`, is_search_fallback: true });
+            }
         } else {
-            const idea = ideas[i];
+            const idea = ideasToUse[i];
             const q = encodeURIComponent(`${idea.title} ${idea.author} ${idea.publication || ''}`);
             articles.push({ ...idea, url: `https://www.google.com/search?q=${q}`, is_search_fallback: true });
         }
     });
+
+    if (articles.length === 0) throw new Error('No articles found after deduplication');
 
     const primary = articles[0];
     primary.alternatives = articles.slice(1);
@@ -518,10 +567,11 @@ async function handleRecommend(chatId, telegramId, user) {
 
     try {
         const existingUrls = await getExistingUrls(user.id);
+        const existingTitles = await getExistingTitles(user.id);
         const topPrefs = await getTopPreferences(user.id, 5);
 
         // Two-step curator: ideas → URL finding (parallel)
-        const article = await generateRecommendation(topPrefs, existingUrls);
+        const article = await generateRecommendation(topPrefs, existingUrls, existingTitles);
 
         // Verify primary link
         const verification = await verifyLink(article.url, article.title);
