@@ -30,6 +30,7 @@ Recommend exactly 3 pieces of exceptional reading material (essays, articles, pa
 - Open access articles (no login required)
 - Academic PDFs when available
 - Depth and analysis over news
+- Articles for which no subscription is required
 
 # CRITICAL RULES
 - Do NOT include URLs — I will find them separately
