@@ -3,10 +3,6 @@ import TelegramBot from 'node-telegram-bot-api';
 import { createClient } from '@supabase/supabase-js';
 import Groq from 'groq-sdk';
 import axios from 'axios';
-import * as cheerio from 'cheerio';
-import { createRequire } from 'module';
-const require = createRequire(import.meta.url);
-const pdf = require('pdf-parse');
 
 // ============ CONFIGURATION ============
 const config = {
@@ -98,7 +94,9 @@ async function saveRecommendation(article) {
             title: article.title,
             author: article.author,
             description: article.description,
+            reason: article.reason,
             tags: article.tags || [],
+            is_verified: article.isVerified || false,
         }, { onConflict: 'url' })
         .select()
         .single();
@@ -112,14 +110,14 @@ async function saveRecommendation(article) {
 async function saveUserRecommendation(userId, recId, messageId) {
     const { error } = await supabase
         .from('user_recommendations')
-        .insert({ user_id: userId, recommendation_id: recId, message_id: messageId });
+        .insert({ user_id: userId, recommendation_id: recId, telegram_message_id: messageId });
     if (error) console.error('saveUserRecommendation error:', error);
 }
 
 async function updateRating(userId, recId, rating) {
     const { data, error } = await supabase
         .from('user_recommendations')
-        .update({ rating })
+        .update({ rating, rated_at: new Date().toISOString() })
         .eq('user_id', userId)
         .eq('recommendation_id', recId)
         .select('*, recommendations(*)')
@@ -166,181 +164,277 @@ async function resetUserPreferences(userId) {
     if (error) console.error('resetUserPreferences error:', error);
 }
 
-// ============ GROQ RECOMMENDATION ============
-const CURATOR_PROMPT = `# ROLE
-You are an elite reading curator—a blend of university professor, editor of "Arts & Letters Daily", and librarian with encyclopedic knowledge spanning both canonical classics and hidden gems.
-
-# USER PROFILE
-- **Weighted Interests**: [USER_INTERESTS]
-- **Intellectual Appetite**: High. Prefers complexity, nuance, original sources, and interdisciplinary synthesis.
-- **Experience Level**: Sophisticated reader who appreciates both timeless classics AND unexpected discoveries.
-
-# YOUR TASK
-Search the web and recommend 2-3 pieces of exceptional reading material.
-
-# THE CURATOR'S COMPASS: Balance & Depth
-
-Your recommendations should reflect the FULL SPECTRUM of great writing:
-
-## 🏛️ TIMELESS CLASSICS (Include at least one)
-The essays and works that have shaped intellectual discourse:
-- **The Great Essayists**: Montaigne, Francis Bacon, Virginia Woolf, George Orwell, Joan Didion, James Baldwin, Susan Sontag, Christopher Hitchens, David Foster Wallace, Zadie Smith
-- **Philosophical Foundations**: Seneca's letters, Marcus Aurelius, Emerson, Thoreau, William James, Bertrand Russell, Isaiah Berlin, Hannah Arendt
-- **Literary Journalism**: New Yorker longform, Paris Review interviews, Granta, Harper's deep dives
-- **Canonical Academic Papers**: Seminal works in psychology (Kahneman, Tversky), economics (Coase, Akerlof), game theory (Schelling)
-
-## 💎 HIDDEN GEMS (Include at least one)
-The overlooked treasures and modern depth:
-- **Independent Thinkers**: Gwern, Scott Alexander (Astral Codex Ten), Paul Graham, Robin Hanson, Tyler Cowen
-- **Niche Journals**: Aeon, The New Atlantis, Inference Review, Works in Progress, Quillette, N+1
-- **Academic Preprints**: ArXiv, SSRN, PhilPapers, NBER working papers
-- **Forgotten Classics**: Out-of-print essays, rehabilitated ideas, historical primary sources
-
-# LINK PRIORITIES
-1. **PDFs** - Direct PDF links from academic sources (HIGHEST PRIORITY)
-2. **Open Access** - Fully accessible without login (Substack, Medium, Blogs)
-3. **Soft Paywall** - Acceptable if content is exceptional (New Yorker, Atlantic)
-
-# EXCLUSIONS (Do NOT Recommend)
-- **Full Books** (Amazon, Goodreads, etc.) - The user wants *articles* and *essays* to read now.
-- **Videos** (YouTube)
-- **Podcasts** (Spotify)
-- **Short News** (Reuters, AP) - User wants *analysis* and *depth*.
-
-# OUTPUT FORMAT
-Respond with ONLY a JSON object:
-{
-  "recommendations": [
-    {
-      "title": "Title of article/essay",
-      "author": "Author name",
-      "url": "Direct URL (prefer PDF)",
-      "description": "2-3 sentence summary of the key insight",
-      "reason": "Why this matches user interests + why it's worth reading",
-      "tags": ["Tag1", "Tag2"],
-      "is_pdf": true/false,
-      "category": "classic" or "gem"
-    }
-  ]
+async function updateUserPreference(userId, tag, weightDelta) {
+    const { data: existing } = await supabase
+        .from('user_preferences')
+        .select('*')
+        .eq('user_id', userId)
+        .eq('tag', tag)
+        .single();
+    const currentWeight = existing?.weight ?? 50;
+    const currentCount = existing?.sample_count ?? 0;
+    const newWeight = Math.max(0, Math.min(100, currentWeight + weightDelta));
+    const { error } = await supabase
+        .from('user_preferences')
+        .upsert({
+            user_id: userId, tag,
+            weight: newWeight,
+            sample_count: currentCount + 1,
+        }, { onConflict: 'user_id,tag' });
+    if (error) console.error('updateUserPreference error:', error);
+    return newWeight;
 }
 
-Provide 2-3 recommendations. LEAN SLIGHTLY towards 'Hidden Gems' (e.g. 2 Gems, 1 Classic), but keep a mix. Make at least one a PDF if possible. Ensure they are ARTICLES or ESSAYS, not books.`;
+// ============ TASTE LEARNING ============
+function calculateImpact(rating) {
+    return (rating - 3) * 2;
+}
+
+async function updateTasteFromRating(userId, tags, rating) {
+    const impact = calculateImpact(rating);
+    if (impact === 0) return;
+    for (const tag of tags) {
+        await updateUserPreference(userId, tag, impact);
+    }
+}
+
+// ============ TWO-STEP CURATOR ============
+
+const CURATION_PROMPT = `You are an elite reading curator — a blend of university professor, Arts & Letters Daily editor, and librarian with encyclopedic knowledge.
+
+# USER INTERESTS
+[USER_INTERESTS]
+
+# TASK
+Recommend exactly 3 pieces of exceptional reading material (essays, articles, papers — NOT books, videos, or podcasts).
+
+# WHAT TO RECOMMEND
+## Mix Required:
+- 1-2 TIMELESS CLASSICS: Montaigne, Orwell, Woolf, Didion, Baldwin, Sontag, Seneca, Emerson, Berlin, Arendt, Kahneman, Coase, etc. OR major journal longform (New Yorker, Paris Review, Granta, Harper's)
+- 1-2 HIDDEN GEMS: Paul Graham, Gwern, Scott Alexander, Tyler Cowen, Robin Hanson, or niche journals (Aeon, The New Atlantis, Works in Progress, N+1), or academic preprints (ArXiv, SSRN, NBER)
+
+## Prefer:
+- Open access articles (no login required)
+- Academic PDFs when available
+- Depth and analysis over news
+
+# CRITICAL RULES
+- Do NOT include URLs — I will find them separately
+- Do NOT recommend books, videos, podcasts, or short news
+- Each recommendation MUST be a specific, real, existing article or essay — not something you invented
+- Include the publication/website where this was originally published
+
+# OUTPUT FORMAT
+Respond with ONLY this JSON (no markdown, no backticks):
+{"recommendations": [{"title": "Exact title of the article", "author": "Author name", "publication": "Where it was published", "description": "2-3 sentence summary", "reason": "Why this matches the user's interests", "tags": ["Tag1", "Tag2"], "category": "classic" or "gem"}]}`;
+
+const URL_FINDER_PROMPT = `Find the exact, working URL for this specific article. Search the web for it.
+
+Article: "[TITLE]" by [AUTHOR]
+Published in/on: [PUBLICATION]
+
+Rules:
+- Return ONLY the direct URL to this article (not a search results page)
+- Prefer: direct PDF links > original publication page > mirrors/archives
+- The URL must be the actual article, not a book listing, review, or summary
+- If you cannot find this exact article, find the closest matching article by the same author on a similar topic
+
+Respond with ONLY this JSON (no markdown):
+{"url": "https://...", "found_title": "actual title found", "source": "domain.com"}`;
+
+async function retryWithBackoff(fn, maxRetries = 2, initialDelayMs = 2000) {
+    let lastError;
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try { return await fn(); }
+        catch (error) {
+            lastError = error;
+            if ((error.status === 429 || error.message?.includes('rate')) && attempt < maxRetries) {
+                await new Promise(r => setTimeout(r, initialDelayMs * Math.pow(2, attempt - 1)));
+            } else throw error;
+        }
+    }
+    throw lastError;
+}
+
+function parseJSON(content) {
+    try {
+        const trimmed = content.trim();
+        const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/);
+        const jsonStr = fenced ? fenced[1].trim() : trimmed;
+        const parsed = JSON.parse(jsonStr);
+        if (parsed.recommendations) return parsed.recommendations;
+        if (Array.isArray(parsed)) return parsed;
+        return [parsed];
+    } catch {
+        const obj = content.match(/\{[\s\S]*\}/);
+        if (obj) {
+            try {
+                const p = JSON.parse(obj[0]);
+                return p.recommendations || [p];
+            } catch { /* fall through */ }
+        }
+        throw new Error('JSON parse failed');
+    }
+}
+
+function parseURLResponse(content) {
+    try {
+        const trimmed = content.trim();
+        const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/);
+        const jsonStr = fenced ? fenced[1].trim() : trimmed;
+        try { return JSON.parse(jsonStr); } catch { /* try extraction */ }
+        const obj = content.match(/\{[\s\S]*?\}/);
+        if (obj) return JSON.parse(obj[0]);
+        const urlMatch = content.match(/https?:\/\/[^\s"<>]+/);
+        return urlMatch ? { url: urlMatch[0] } : null;
+    } catch {
+        const urlMatch = content.match(/https?:\/\/[^\s"<>]+/);
+        return urlMatch ? { url: urlMatch[0] } : null;
+    }
+}
+
+function isValidUrl(url) {
+    try { const p = new URL(url); return p.protocol === 'http:' || p.protocol === 'https:'; }
+    catch { return false; }
+}
+
+async function curateIdeas(preferences, existingUrls = []) {
+    const groq = new Groq({ apiKey: config.groq.apiKey });
+    const topInterests = preferences
+        .sort((a, b) => b.weight - a.weight).slice(0, 5)
+        .map(w => `${w.tag} (${Math.round(w.weight)}%)`).join(', ')
+        || 'Philosophy, Psychology, Economics, History, Essays';
+
+    const prompt = CURATION_PROMPT.replace('[USER_INTERESTS]', topInterests);
+    console.log(`🧠 Step 1: Curating ideas for: ${topInterests}`);
+
+    const response = await retryWithBackoff(() =>
+        groq.chat.completions.create({
+            model: 'llama-3.3-70b-versatile',
+            messages: [{ role: 'user', content: prompt }],
+            temperature: 0.7, max_tokens: 2000,
+        })
+    );
+
+    const content = response.choices[0]?.message?.content;
+    if (!content) throw new Error('Empty response from Groq (Step 1)');
+    return parseJSON(content);
+}
+
+async function findUrlForArticle(idea) {
+    const groq = new Groq({ apiKey: config.groq.apiKey });
+    const prompt = URL_FINDER_PROMPT
+        .replace('[TITLE]', idea.title)
+        .replace('[AUTHOR]', idea.author)
+        .replace('[PUBLICATION]', idea.publication || 'unknown');
+    try {
+        const response = await retryWithBackoff(() =>
+            groq.chat.completions.create({
+                model: 'groq/compound-mini',
+                messages: [{ role: 'user', content: prompt }],
+            })
+        );
+        const content = response.choices[0]?.message?.content;
+        if (!content) return null;
+        const result = parseURLResponse(content);
+        if (result?.url && isValidUrl(result.url)) {
+            return { ...idea, url: result.url, source: result.source || '' };
+        }
+        return null;
+    } catch (error) {
+        console.warn(`⚠️ URL search failed for "${idea.title}": ${error.message}`);
+        return null;
+    }
+}
 
 async function generateRecommendation(preferences, existingUrls = []) {
-    const groq = new Groq({ apiKey: config.groq.apiKey });
+    const ideas = await curateIdeas(preferences, existingUrls);
+    if (!ideas.length) throw new Error('No ideas generated');
+    console.log(`📚 Step 1: ${ideas.length} ideas`);
 
-    const topInterests = preferences
-        .sort((a, b) => b.weight - a.weight)
-        .slice(0, 5)
-        .map(w => `${w.tag} (${Math.round(w.weight)})% `)
-        .join(', ') || 'Philosophy, Psychology, Economics, History, Essays';
+    // Step 2: Find URLs in parallel
+    console.log(`🔍 Step 2: Finding URLs (parallel)...`);
+    const results = await Promise.allSettled(ideas.map(i => findUrlForArticle(i)));
 
-    const existingList = existingUrls.length > 0
-        ? existingUrls.slice(0, 20).map(url => `- ${url} `).join('\n')
-        : '(None yet)';
-
-    const prompt = CURATOR_PROMPT
-        .replace('[USER_INTERESTS]', topInterests)
-        .replace('[EXISTING_URLS]', existingList);
-
-    console.log(`🧠 Generating recommendations for: ${topInterests} `);
-
-    try {
-        const response = await groq.chat.completions.create({
-            model: 'groq/compound-mini', // Better for rate limits
-            messages: [{ role: 'user', content: prompt }],
-        });
-
-        const content = response.choices[0]?.message?.content || '';
-
-        // Robust JSON parsing
-        const jsonMatch = content.match(/\{[\s\S]*\}/);
-        if (!jsonMatch) {
-            console.error('Groq Response Content:', content);
-            throw new Error('No JSON found in Groq response');
+    const articles = [];
+    results.forEach((r, i) => {
+        if (r.status === 'fulfilled' && r.value) {
+            articles.push(r.value);
+        } else {
+            const idea = ideas[i];
+            const q = encodeURIComponent(`${idea.title} ${idea.author} ${idea.publication || ''}`);
+            articles.push({ ...idea, url: `https://www.google.com/search?q=${q}`, is_search_fallback: true });
         }
+    });
 
-        const parsed = JSON.parse(jsonMatch[0]);
-        const recs = parsed.recommendations || (Array.isArray(parsed) ? parsed : [parsed]);
-
-        if (!recs || recs.length === 0) throw new Error('No recommendations found');
-
-        // Sort: PDFs first
-        recs.sort((a, b) => (a.is_pdf === b.is_pdf) ? 0 : a.is_pdf ? -1 : 1);
-
-        const primary = recs[0];
-        primary.alternatives = recs.slice(1);
-
-        if (!primary.url || !primary.title) throw new Error('Invalid recommendation structure');
-
-        return primary;
-    } catch (error) {
-        console.error('Groq Generation Error:', error);
-        throw error; // Re-throw to be caught by caller
-    }
+    const primary = articles[0];
+    primary.alternatives = articles.slice(1);
+    primary.backup_urls = [];
+    console.log(`✅ Primary: "${primary.title}" — ${primary.url}`);
+    return primary;
 }
 
 // ============ LINK VERIFIER ============
+
+const BROWSER_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9',
+};
+
+const TRUSTED_DOMAINS = [
+    'aeon.co', 'paulgraham.com', 'gwern.net', 'substack.com', 'arxiv.org', 'ssrn.com',
+    'nber.org', 'jstor.org', 'plato.stanford.edu', 'medium.com', 'wikipedia.org',
+    'theatlantic.com', 'newyorker.com', 'econlib.org', 'gutenberg.org', 'archive.org',
+    'lesswrong.com', 'marginalrevolution.com', 'nautil.us', 'quillette.com',
+    'thenewatlantis.com', 'worksinprogress.co', 'theguardian.com', 'researchgate.net',
+];
+
+const PAYWALL_DOMAINS = ['nytimes.com', 'wsj.com', 'ft.com', 'economist.com', 'wired.com', 'hbr.org'];
+
+function isDomainInList(url, list) {
+    try { const h = new URL(url).hostname.toLowerCase(); return list.some(d => h.includes(d)); }
+    catch { return false; }
+}
+
+function isSearchFallbackUrl(url) {
+    try { return new URL(url).hostname.includes('google.com') && url.includes('/search?'); }
+    catch { return false; }
+}
+
 async function verifyLink(url, expectedTitle = '') {
+    if (isSearchFallbackUrl(url)) {
+        return { isValid: true, confidence: 'low', isSearchFallback: true, isPaywall: false };
+    }
+
+    const isTrusted = isDomainInList(url, TRUSTED_DOMAINS);
+    const isPaywall = isDomainInList(url, PAYWALL_DOMAINS);
+
     try {
         const response = await axios.get(url, {
-            timeout: 8000,
-            responseType: 'arraybuffer', // Get buffer for PDF/HTML
-            maxContentLength: 5 * 1024 * 1024, // 5MB limit
-            headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
+            timeout: 8000, maxRedirects: 5,
+            headers: BROWSER_HEADERS,
             validateStatus: () => true,
+            maxContentLength: 500000,
+            responseType: 'text',
         });
 
-        if (response.status < 200 || response.status >= 400) {
-            return { isValid: false, reason: `Status ${response.status}`, status: response.status };
+        const status = response.status;
+        if (status === 404 || status === 410) {
+            return { isValid: false, confidence: 'high', status, reason: 'Page not found', isPaywall: false };
         }
-
-        const contentType = (response.headers['content-type'] || '').toLowerCase();
-        let pageTitle = '';
-        let pageText = '';
-
-        try {
-            if (contentType.includes('pdf')) {
-                // PDF Check
-                const data = await pdf(response.data);
-                pageTitle = data.info?.Title || '';
-                pageText = data.text ? data.text.slice(0, 1500) : '';
-            } else {
-                // HTML Check
-                const html = response.data.toString();
-                const $ = cheerio.load(html);
-                pageTitle = $('title').text() || $('h1').first().text() || $('meta[name="title"]').attr('content') || '';
-                pageText = $('body').text().slice(0, 1000);
-            }
-        } catch (parseError) {
-            console.warn('Content parse failed:', parseError.message);
-            // If parsing fails but status is 200, we loosely accept it but flag it
-            return { isValid: true, status: 200, warning: 'Content check skipped (parse error)' };
+        if (status >= 200 && status < 400) {
+            return { isValid: true, confidence: isTrusted ? 'high' : 'medium', status, isPaywall };
         }
-
-        // Verification Logic
-        if (!expectedTitle) return { isValid: true, status: response.status };
-
-        const clean = (str) => (str || '').toLowerCase().replace(/[^\w\s]/g, '');
-        const normExpected = clean(expectedTitle);
-        const normActual = clean(pageTitle + ' ' + pageText.slice(0, 200)); // Check title + start of text
-
-        // Check for keyword overlap
-        const keywords = normExpected.split(/\s+/).filter(w => w.length > 3);
-        if (keywords.length === 0) return { isValid: true, status: 200 }; // Title too short to verify
-
-        const matches = keywords.filter(w => normActual.includes(w));
-        const matchRatio = matches.length / keywords.length;
-
-        // Threshold: Must match at least 1 significant keyword if we have >1 keywords
-        if (matchRatio === 0 && keywords.length > 1) {
-            console.log(`Mismatch: Expected "${expectedTitle}" | Found "${pageTitle}"`);
-            return { isValid: false, reason: 'Content mismatch (Hallucination detected)', status: 418 }; // 418 = I'm a teapot (custom code for logic fail)
+        if (status === 401 || status === 403) {
+            return { isValid: true, confidence: 'medium', status, isPaywall: true, reason: 'Login required' };
         }
-
-        return { isValid: true, status: response.status };
-    } catch (e) {
-        return { isValid: false, reason: e.message };
+        return { isValid: false, confidence: 'low', status, reason: `HTTP ${status}`, isPaywall: false };
+    } catch (error) {
+        const code = error.code || '';
+        if (code === 'ENOTFOUND') return { isValid: false, confidence: 'high', reason: 'Domain not found', isPaywall: false };
+        if (isTrusted || isPaywall) return { isValid: true, confidence: 'low', reason: 'Trusted domain (check blocked)', isPaywall };
+        return { isValid: false, confidence: 'low', reason: code || error.message, isPaywall: false };
     }
 }
 
@@ -348,18 +442,18 @@ async function verifyLink(url, expectedTitle = '') {
 async function handleStart(chatId, telegramId, username) {
     await createUser(telegramId, username, telegramId === config.telegram.ownerId);
 
-    const message = `📚 ** Welcome to Essai! **
+    const message = `📚 **Welcome to Essai!**
 
-    I'm your personal reading curator. I find intellectually stimulating essays, papers, and articles tailored to your interests.
+I'm your personal reading curator. I find intellectually stimulating essays, papers, and articles tailored to your interests.
 
-        ** Commands:**
+**Commands:**
 • /recommend - Get a reading recommendation
 • /preferences - See your taste profile
 • /settag \`tag\` \`weight\` - Set a tag weight (0-100)
 • /addtag \`tag\` - Add new interest
 • /removetag \`tag\` - Remove a tag
 • /resettaste - Reset all preferences
-• /pause / / resume - Toggle scheduled pushes
+• /pause / /resume - Toggle scheduled pushes
 • /help - Show this list again
 
 Start with /preferences to see your interests, then /recommend!`;
@@ -368,8 +462,7 @@ Start with /preferences to see your interests, then /recommend!`;
 }
 
 async function handleHelp(chatId) {
-    const message = `
-** Available Commands:**
+    const message = `**Available Commands:**
 
 • /recommend - Get a reading recommendation
 • /preferences - See your taste profile
@@ -378,52 +471,98 @@ async function handleHelp(chatId) {
 • /removetag <tag> - Remove a tag
 • /resettaste - Reset all preferences
 • /pause - Pause scheduled recommendations
-• /resume - Resume scheduled recommendations
-`;
+• /resume - Resume scheduled recommendations`;
     await bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
 }
 
 async function handleRecommend(chatId, telegramId, user) {
-    const loadingMsg = await bot.sendMessage(chatId, '🧠 **Curating recommendations...**', { parse_mode: 'Markdown' });
+    const loadingMsg = await bot.sendMessage(chatId,
+        '🧠 **Curating recommendations...**\n\n_Step 1: Selecting articles from the canon..._',
+        { parse_mode: 'Markdown' }
+    );
 
     try {
         const existingUrls = await getExistingUrls(user.id);
         const topPrefs = await getTopPreferences(user.id, 5);
+
+        // Two-step curator: ideas → URL finding (parallel)
         const article = await generateRecommendation(topPrefs, existingUrls);
+
+        // Verify primary link
         const verification = await verifyLink(article.url, article.title);
+        article.isVerified = verification.isValid;
+
+        // If primary fails verification, try alternatives
+        let deliveredArticle = article;
+        let deliveredVerification = verification;
+
+        if (!verification.isValid && article.alternatives?.length > 0) {
+            console.log(`⚠️ Primary link invalid, trying alternatives...`);
+            for (const alt of article.alternatives) {
+                const altVerify = await verifyLink(alt.url, alt.title);
+                if (altVerify.isValid) {
+                    deliveredArticle = { ...alt, alternatives: article.alternatives.filter(a => a !== alt) };
+                    deliveredVerification = altVerify;
+                    console.log(`✅ Alternative found: "${alt.title}"`);
+                    break;
+                }
+            }
+        }
 
         await bot.deleteMessage(chatId, loadingMsg.message_id);
 
-        if (!verification.isValid) {
-            throw new Error(`Link Verification Failed: ${verification.reason} (${article.url})`);
+        // Save to database
+        const savedRec = await saveRecommendation(deliveredArticle);
+
+        // Build message — ALWAYS deliver, never error
+        const categoryEmoji = deliveredArticle.category === 'classic' ? '🏛️' : '💎';
+        const tags = (deliveredArticle.tags || []).map(t => `#${t.replace(/\s+/g, '')}`).join(' ');
+
+        // Status emoji based on verification confidence
+        let statusEmoji = '✅';
+        let statusNote = '';
+        if (deliveredVerification.isSearchFallback || deliveredArticle.is_search_fallback) {
+            statusEmoji = '🔎';
+            statusNote = '\n_Link goes to Google Search — look for the article there_';
+        } else if (deliveredVerification.isPaywall) {
+            statusEmoji = '⚠️';
+            statusNote = '\n_May require subscription_';
+        } else if (!deliveredVerification.isValid) {
+            statusEmoji = '❓';
+            statusNote = '\n_Link not verified — may not work_';
         }
 
-        const savedRec = await saveRecommendation(article);
-        const verifiedEmoji = verification.isValid ? '✅' : '❓';
-        const categoryEmoji = article.category === 'classic' ? '🏛️' : '💎';
-        const tags = (article.tags || []).map(t => `#${t.replace(/\s+/g, '')} `).join(' ');
+        let message = `${categoryEmoji} **${deliveredArticle.title}**\n_by ${deliveredArticle.author}_`;
+        if (deliveredArticle.publication) {
+            message += ` — _${deliveredArticle.publication}_`;
+        }
+        message += `\n\n${deliveredArticle.description}`;
+        message += `\n\n💡 **Why this?** ${deliveredArticle.reason}`;
+        message += `\n\n${tags}`;
+        message += `\n\n🔗 [Read](${deliveredArticle.url}) ${statusEmoji}${statusNote}`;
 
-        let message = `${categoryEmoji} ** ${article.title}**\n * by ${article.author}*\n\n${article.description} \n\n💡 ** Why this ?** ${article.reason} \n\n${tags} \n\n🔗[Read](${article.url}) ${verifiedEmoji} `;
-
-        if (article.alternatives?.length > 0) {
-            message += `\n\n📚 ** Alternatives:** `;
-            article.alternatives.forEach(r => {
-                message += `\n•[${r.title}](${r.url}) - _${r.author} _`;
+        // Add alternatives
+        if (deliveredArticle.alternatives?.length > 0) {
+            message += `\n\n📚 **Also recommended:**`;
+            deliveredArticle.alternatives.forEach(r => {
+                const altEmoji = r.is_search_fallback ? '🔎' : '';
+                message += `\n• [${r.title}](${r.url}) ${altEmoji} — _${r.author}_`;
             });
         }
 
         const sentMsg = await bot.sendMessage(chatId, message, {
             parse_mode: 'Markdown',
+            disable_web_page_preview: false,
             reply_markup: {
                 inline_keyboard: [
                     [
-                        { text: '⭐1', callback_data: `rate:${savedRec.id}: 1` },
-                        { text: '⭐2', callback_data: `rate:${savedRec.id}: 2` },
-                        { text: '⭐3', callback_data: `rate:${savedRec.id}: 3` },
-                        { text: '⭐4', callback_data: `rate:${savedRec.id}: 4` },
-                        { text: '⭐5', callback_data: `rate:${savedRec.id}: 5` },
+                        { text: '⭐1', callback_data: `rate:${savedRec.id}:1` },
+                        { text: '⭐2', callback_data: `rate:${savedRec.id}:2` },
+                        { text: '⭐3', callback_data: `rate:${savedRec.id}:3` },
+                        { text: '⭐4', callback_data: `rate:${savedRec.id}:4` },
+                        { text: '⭐5', callback_data: `rate:${savedRec.id}:5` },
                     ],
-                    [{ text: '🎲 Recommend Something Else', callback_data: `rate:${savedRec.id}: 0: reroll` }]
+                    [{ text: '🎲 Recommend Something Else', callback_data: `rate:${savedRec.id}:0:reroll` }]
                 ]
             }
         });
@@ -432,53 +571,44 @@ async function handleRecommend(chatId, telegramId, user) {
     } catch (error) {
         console.error('Recommend error:', error);
         await bot.deleteMessage(chatId, loadingMsg.message_id).catch(() => { });
-        console.error('Full Error Object:', JSON.stringify(error, Object.getOwnPropertyNames(error)));
-
-        let errorMsg = '❌ Failed to generate recommendation.';
-        if (error.message.includes('JSON')) errorMsg += ' (AI Response Formatting Error)';
-        if (error.message.includes('tim')) errorMsg += ' (Timeout)';
-        errorMsg += `\n\nDebug: ${error.message.slice(0, 100)} `;
-
-        await bot.sendMessage(chatId, errorMsg);
+        await bot.sendMessage(chatId, `❌ Failed to generate recommendation. Please try /recommend again.\n\n_Debug: ${error.message?.slice(0, 80)}_`, { parse_mode: 'Markdown' });
     }
 }
 
 async function handlePreferences(chatId, userId) {
-    const prefs = await getTopPreferences(userId, 7);
+    let prefs = await getTopPreferences(userId, 7);
     if (!prefs.length) {
-        await bot.sendMessage(chatId, '📊 No preferences yet. Rate some articles!');
-        return;
+        // Initialize defaults
+        const defaults = ['Psychology', 'Philosophy', 'Economics', 'Physics', 'History', 'Essays', 'Game Theory', 'Biology', 'Sociology', 'Mathematics'];
+        for (const tag of defaults) await setUserPreference(userId, tag, 50);
+        prefs = await getTopPreferences(userId, 7);
     }
-    const list = prefs.map(p => `• ${p.tag}: ${Math.round(p.weight * 100)}% `).join('\n');
-    await bot.sendMessage(chatId, `📊 ** Your Taste Profile:**\n\n${list} `, { parse_mode: 'Markdown' });
+    const getBar = (w) => '█'.repeat(Math.round(w / 10)) + '░'.repeat(10 - Math.round(w / 10));
+    const list = prefs.map((p, i) => `${i + 1}. **${p.tag}** ${getBar(p.weight)} ${Math.round(p.weight)}%`).join('\n');
+    await bot.sendMessage(chatId, `📊 **Your Interests:**\n\n${list}\n\n_Use /settag, /addtag, /removetag to customize_`, { parse_mode: 'Markdown' });
 }
 
 async function handleSetTag(chatId, userId, args) {
     if (!args) return bot.sendMessage(chatId, '⚠️ Usage: /settag <Tag Name> <Weight>');
-
-    // Split on last space to get weight
     const lastSpaceIndex = args.lastIndexOf(' ');
     if (lastSpaceIndex === -1) return bot.sendMessage(chatId, '⚠️ Usage: /settag <Tag Name> <Weight>');
-
     const tag = args.substring(0, lastSpaceIndex).trim();
     const weight = parseInt(args.substring(lastSpaceIndex + 1), 10);
-
     if (isNaN(weight) || weight < 0 || weight > 100) return bot.sendMessage(chatId, '⚠️ Weight must be 0-100');
-
     await setUserPreference(userId, tag, weight);
-    await bot.sendMessage(chatId, `✅ Set ** ${tag}** to ${weight}% `, { parse_mode: 'Markdown' });
+    await bot.sendMessage(chatId, `✅ Set **${tag}** to ${weight}%`, { parse_mode: 'Markdown' });
 }
 
 async function handleAddTag(chatId, userId, tag) {
     if (!tag) return bot.sendMessage(chatId, '⚠️ Usage: /addtag <Tag Name>');
     await setUserPreference(userId, tag, 50);
-    await bot.sendMessage(chatId, `✅ Added interest: ** ${tag}** `, { parse_mode: 'Markdown' });
+    await bot.sendMessage(chatId, `✅ Added interest: **${tag}**`, { parse_mode: 'Markdown' });
 }
 
 async function handleRemoveTag(chatId, userId, tag) {
     if (!tag) return bot.sendMessage(chatId, '⚠️ Usage: /removetag <Tag Name>');
     await removeUserPreference(userId, tag);
-    await bot.sendMessage(chatId, `🗑️ Removed interest: ** ${tag}** `, { parse_mode: 'Markdown' });
+    await bot.sendMessage(chatId, `🗑️ Removed interest: **${tag}**`, { parse_mode: 'Markdown' });
 }
 
 async function handleResetTaste(chatId, userId) {
@@ -499,9 +629,8 @@ async function handleResume(chatId, telegramId) {
 async function handleDebug(chatId, telegramId) {
     const user = await getUser(telegramId);
     const status = user ? user.status : 'Unknown';
-    await bot.sendMessage(chatId, `🔧 ** Debug Info **\n\n• User ID: \`${telegramId}\`\n• Status: ${status}\n• Mode: Serverless (Vercel)`, { parse_mode: 'Markdown' });
+    await bot.sendMessage(chatId, `🔧 **Debug Info**\n\n• User ID: \`${telegramId}\`\n• Status: ${status}\n• Mode: Serverless (Vercel)\n• Curator: Two-step (llama-3.3 + compound-mini)`, { parse_mode: 'Markdown' });
 }
-
 
 // ============ ACCESS CONTROL ============
 async function processMessage(msg) {
@@ -510,9 +639,8 @@ async function processMessage(msg) {
     const username = msg.from.username || msg.from.first_name;
     const text = msg.text || '';
 
-    // Parse command and args
     const match = text.match(/^\/(\w+)(?:\s+(.+))?$/);
-    if (!match) return; // Not a command
+    if (!match) return;
 
     const command = match[1];
     const args = match[2];
@@ -549,7 +677,6 @@ async function processMessage(msg) {
         return;
     }
 
-    // Approved User Commands
     switch (command) {
         case 'recommend': return handleRecommend(chatId, telegramId, user);
         case 'preferences': return handlePreferences(chatId, user.id);
@@ -560,7 +687,7 @@ async function processMessage(msg) {
         case 'pause': return handlePause(chatId, telegramId);
         case 'resume': return handleResume(chatId, telegramId);
         case 'debug': return handleDebug(chatId, telegramId);
-        default: break; // Unknown command
+        default: break;
     }
 }
 
@@ -570,11 +697,8 @@ async function processCallback(query) {
     const chatId = query.message.chat.id;
     const messageId = query.message.message_id;
 
-    // Approval callbacks
     if (data.startsWith('approve:')) {
-        if (telegramId !== config.telegram.ownerId) {
-            return bot.answerCallbackQuery(query.id, { text: '🔒 Admin only' });
-        }
+        if (telegramId !== config.telegram.ownerId) return bot.answerCallbackQuery(query.id, { text: '🔒 Admin only' });
         const targetId = parseInt(data.split(':')[1], 10);
         await approveUser(targetId);
         await bot.answerCallbackQuery(query.id, { text: 'User approved!' });
@@ -584,9 +708,7 @@ async function processCallback(query) {
     }
 
     if (data.startsWith('deny:')) {
-        if (telegramId !== config.telegram.ownerId) {
-            return bot.answerCallbackQuery(query.id, { text: '🔒 Admin only' });
-        }
+        if (telegramId !== config.telegram.ownerId) return bot.answerCallbackQuery(query.id, { text: '🔒 Admin only' });
         const targetId = parseInt(data.split(':')[1], 10);
         await blockUser(targetId);
         await bot.answerCallbackQuery(query.id, { text: 'User blocked' });
@@ -594,7 +716,6 @@ async function processCallback(query) {
         return;
     }
 
-    // Rating callbacks
     if (data.startsWith('rate:')) {
         const parts = data.split(':');
         const recId = parts[1];
@@ -604,7 +725,12 @@ async function processCallback(query) {
         const user = await getUser(telegramId);
         if (!user) return bot.answerCallbackQuery(query.id, { text: 'Please /start first' });
 
-        await updateRating(user.id, recId, rating);
+        const userRec = await updateRating(user.id, recId, rating);
+
+        // Taste learning
+        if (rating > 0 && userRec?.recommendations?.tags) {
+            await updateTasteFromRating(user.id, userRec.recommendations.tags, rating);
+        }
 
         if (flag === 'reroll') {
             await bot.answerCallbackQuery(query.id, { text: 'Finding something else... 🎲' });
@@ -627,7 +753,7 @@ export default async function handler(req, res) {
     console.log('📩 Webhook called:', req.method);
 
     if (req.method === 'GET') {
-        return res.status(200).json({ status: 'Essai Bot is active', mode: 'webhook' });
+        return res.status(200).json({ status: 'Essai Bot is active', mode: 'webhook', curator: 'two-step' });
     }
 
     if (req.method !== 'POST') {
@@ -647,6 +773,6 @@ export default async function handler(req, res) {
         res.status(200).json({ ok: true });
     } catch (error) {
         console.error('Webhook error:', error);
-        res.status(200).json({ ok: true, error: error.message }); // Return 200 to prevent Telegram retries
+        res.status(200).json({ ok: true, error: error.message });
     }
 }

@@ -9,28 +9,16 @@ import {
     setUserPreference,
     removeUserPreference,
     resetUserPreferences,
-    updateRecommendationVerification
 } from '../services/supabase.js';
-import { generateRecommendation } from '../services/gemini.js';
+import { generateRecommendation } from '../services/curator.js';
 import { verifyLink } from '../services/linkVerifier.js';
 import { getTopPreferences, formatPreferences } from '../services/tasteLearner.js';
 
-// Store last debug info per user
-const debugStore = new Map();
-
-/**
- * Handle /start command - Register user
- */
+// ============ /start ============
 export async function handleStart(bot, msg) {
     const chatId = msg.chat.id;
-    const telegramId = msg.from.id;
-    const username = msg.from.username || msg.from.first_name;
 
-    try {
-        const user = await createUser(telegramId, username);
-
-        const welcomeMessage = `
-📚 **Welcome to Essai!**
+    const message = `📚 **Welcome to Essai!**
 
 I'm your personal reading curator. I find intellectually stimulating essays, papers, and articles tailored to your interests.
 
@@ -42,105 +30,95 @@ I'm your personal reading curator. I find intellectually stimulating essays, pap
 • /removetag \`tag\` - Remove a tag
 • /resettaste - Reset all preferences
 • /pause / /resume - Toggle scheduled pushes
-• /debug - Show last recommendation details
+• /help - Show this list again
 
-Start with /preferences to see your interests, then /recommend!
-    `.trim();
+Start with /preferences to see your interests, then /recommend!`;
 
-        await bot.sendMessage(chatId, welcomeMessage, { parse_mode: 'Markdown' });
-        console.log(`✅ User registered: ${username} (${telegramId})`);
-    } catch (error) {
-        console.error('Error in /start:', error);
-        await bot.sendMessage(chatId, '❌ Something went wrong. Please try again.');
-    }
+    await bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
 }
 
-/**
- * Handle /recommend command - Get a reading suggestion
- */
+// ============ /recommend ============
 export async function handleRecommend(bot, msg) {
     const chatId = msg.chat.id;
     const telegramId = msg.from.id;
 
+    const loadingMsg = await bot.sendMessage(chatId,
+        '🧠 **Curating recommendations...**\n\n_Step 1: Selecting articles from the canon..._',
+        { parse_mode: 'Markdown' }
+    );
+
     try {
         const user = await getUser(telegramId);
-        if (!user) {
-            await bot.sendMessage(chatId, '❌ Please /start first.');
-            return;
-        }
+        if (!user) throw new Error('User not found');
 
-        // Send "thinking" status
-        const loadingMsg = await bot.sendMessage(chatId, '🧠 **Curating detailed recommendations...**\n\n_Exploring libraries, journals, and archives_ 🏛️', { parse_mode: 'Markdown' });
-
-        // Get recent recommendations to avoid duplicates
         const existingUrls = await getExistingUrls(user.id);
-
-        // Get user preferences
         const topPrefs = await getTopPreferences(user.id, 5);
 
-        let article = null;
-        let verification = null;
+        // Two-step curator: ideas → URLs (parallel)
+        const article = await generateRecommendation(topPrefs, existingUrls);
 
-        // Generate recommendation (returns primary + alternatives)
-        // Groq API call incorporates search, so reliability is high
-        article = await generateRecommendation(topPrefs, existingUrls);
-
-        // Verify PRIMARY link
-        verification = await verifyLink(article.url);
-
-        // Delete loading message
-        await bot.deleteMessage(chatId, loadingMsg.message_id);
-
-        if (!article) {
-            await bot.sendMessage(chatId, '❌ Could not find a suitable recommendation. Please try again.');
-            return;
-        }
-
+        // Verify primary link
+        const verification = await verifyLink(article.url, article.title);
         article.isVerified = verification.isValid;
 
-        // Save primary to database
-        const savedRec = await saveRecommendation(article);
-        await updateRecommendationVerification(savedRec.id, verification.isValid);
+        // If primary fails verification, try alternatives
+        let deliveredArticle = article;
+        let deliveredVerification = verification;
 
-        // Store debug info
-        debugStore.set(telegramId, {
-            article,
-            verification,
-            timestamp: new Date().toISOString()
-        });
+        if (!verification.isValid && article.alternatives?.length > 0) {
+            console.log(`⚠️ Primary link invalid, trying alternatives...`);
+            for (const alt of article.alternatives) {
+                const altVerify = await verifyLink(alt.url, alt.title);
+                if (altVerify.isValid) {
+                    deliveredArticle = { ...alt, alternatives: article.alternatives.filter(a => a !== alt) };
+                    deliveredVerification = altVerify;
+                    console.log(`✅ Alternative found: "${alt.title}"`);
+                    break;
+                }
+            }
+        }
 
-        // Format primary recommendation
-        const verifiedEmoji = verification.isPaywall ? '⚠️' : (verification.isValid ? '✅' : '❓');
-        const categoryEmoji = article.category === 'classic' ? '🏛️' : '💎';
-        const pdfEmoji = article.is_pdf ? '📄' : '';
-        // Handle tags safely
-        const tagsList = Array.isArray(article.tags) ? article.tags : [];
-        const tagsFormatted = tagsList.map(t => `#${t.replace(/\s+/g, '')}`).join(' ');
+        await bot.deleteMessage(chatId, loadingMsg.message_id);
 
-        let message = `
-${categoryEmoji} **${article.title}** ${pdfEmoji}
-*by ${article.author}*
+        // Save to database
+        const savedRec = await saveRecommendation(deliveredArticle);
 
-${article.description}
+        // Build message — ALWAYS deliver, never error
+        const categoryEmoji = deliveredArticle.category === 'classic' ? '🏛️' : '💎';
+        const tags = (deliveredArticle.tags || []).map(t => `#${t.replace(/\s+/g, '')}`).join(' ');
 
-💡 **Why this?** ${article.reason}
+        // Status emoji based on verification confidence
+        let statusEmoji = '✅';
+        let statusNote = '';
+        if (deliveredVerification.isSearchFallback || deliveredArticle.is_search_fallback) {
+            statusEmoji = '🔎';
+            statusNote = '\n_Link goes to Google Search — look for the article there_';
+        } else if (deliveredVerification.isPaywall) {
+            statusEmoji = '⚠️';
+            statusNote = '\n_May require subscription_';
+        } else if (!deliveredVerification.isValid) {
+            statusEmoji = '❓';
+            statusNote = '\n_Link not verified — may not work_';
+        }
 
-${tagsFormatted}
+        let message = `${categoryEmoji} **${deliveredArticle.title}**\n_by ${deliveredArticle.author}_`;
+        if (deliveredArticle.publication) {
+            message += ` — _${deliveredArticle.publication}_`;
+        }
+        message += `\n\n${deliveredArticle.description}`;
+        message += `\n\n💡 **Why this?** ${deliveredArticle.reason}`;
+        message += `\n\n${tags}`;
+        message += `\n\n🔗 [Read](${deliveredArticle.url}) ${statusEmoji}${statusNote}`;
 
-🔗 [Read Primary Selection](${article.url}) ${verifiedEmoji}
-`.trim();
-
-        // Add alternatives if available
-        if (article.alternatives && article.alternatives.length > 0) {
-            message += `\n\n📚 **Alternative Readings:**\n`;
-
-            article.alternatives.forEach(rec => {
-                const recPdf = rec.is_pdf ? '📄 ' : '';
-                message += `\n• [${rec.title}](${rec.url}) ${recPdf}- _${rec.author}_`;
+        // Add alternatives
+        if (deliveredArticle.alternatives?.length > 0) {
+            message += `\n\n📚 **Also recommended:**`;
+            deliveredArticle.alternatives.forEach(r => {
+                const altEmoji = r.is_search_fallback ? '🔎' : '';
+                message += `\n• [${r.title}](${r.url}) ${altEmoji} — _${r.author}_`;
             });
         }
 
-        // Send with rating buttons
         const sentMsg = await bot.sendMessage(chatId, message, {
             parse_mode: 'Markdown',
             disable_web_page_preview: false,
@@ -153,233 +131,110 @@ ${tagsFormatted}
                         { text: '⭐4', callback_data: `rate:${savedRec.id}:4` },
                         { text: '⭐5', callback_data: `rate:${savedRec.id}:5` },
                     ],
-                    [
-                        { text: '🎲 Recommend Something Else', callback_data: `rate:${savedRec.id}:0:reroll` },
-                    ]
+                    [{ text: '🎲 Recommend Something Else', callback_data: `rate:${savedRec.id}:0:reroll` }]
                 ]
             }
         });
 
-        // Save user-recommendation mapping
         await saveUserRecommendation(user.id, savedRec.id, sentMsg.message_id);
-
-        console.log(`📚 Sent recommendations to ${telegramId}: ${article.title}`);
     } catch (error) {
-        console.error('Error in /recommend:', error);
-        await bot.sendMessage(chatId, '❌ Failed to generate recommendation. Please try again.');
+        console.error('Recommend error:', error);
+        await bot.deleteMessage(chatId, loadingMsg.message_id).catch(() => { });
+        await bot.sendMessage(chatId, `❌ Failed to generate recommendation. Please try /recommend again.\n\n_Debug: ${error.message?.slice(0, 80)}_`, { parse_mode: 'Markdown' });
     }
 }
 
-/**
- * Handle /preferences command - Show taste profile
- */
+// ============ /preferences ============
 export async function handlePreferences(bot, msg) {
     const chatId = msg.chat.id;
     const telegramId = msg.from.id;
+    const user = await getUser(telegramId);
+    if (!user) return bot.sendMessage(chatId, '❌ Please /start first');
 
-    try {
-        const user = await getUser(telegramId);
-        if (!user) {
-            await bot.sendMessage(chatId, '❌ Please /start first.');
-            return;
-        }
-
-        const topPrefs = await getTopPreferences(user.id, 7);
-        const formatted = formatPreferences(topPrefs);
-
-        await bot.sendMessage(chatId, formatted, { parse_mode: 'Markdown' });
-    } catch (error) {
-        console.error('Error in /preferences:', error);
-        await bot.sendMessage(chatId, '❌ Failed to load preferences.');
+    let prefs = await getTopPreferences(user.id, 7);
+    if (!prefs.length) {
+        const defaults = ['Psychology', 'Philosophy', 'Economics', 'Physics', 'History', 'Essays', 'Game Theory', 'Biology', 'Sociology', 'Mathematics'];
+        for (const tag of defaults) await setUserPreference(user.id, tag, 50);
+        prefs = await getTopPreferences(user.id, 7);
     }
+    const format = formatPreferences(prefs);
+    await bot.sendMessage(chatId, `📊 **Your Interests:**\n\n${format}\n\n_Use /settag, /addtag, /removetag to customize_`, { parse_mode: 'Markdown' });
 }
 
-/**
- * Handle /debug command - Show last recommendation details
- */
+// ============ /debug ============
 export async function handleDebug(bot, msg) {
     const chatId = msg.chat.id;
     const telegramId = msg.from.id;
-
-    try {
-        const debugInfo = debugStore.get(telegramId);
-
-        if (!debugInfo) {
-            await bot.sendMessage(chatId, '🔍 No recent recommendations to debug.');
-            return;
-        }
-
-        const message = `
-🔧 **Debug Info**
-
-**Last Request:** ${debugInfo.timestamp}
-
-**Article:**
-• Title: ${debugInfo.article.title}
-• Author: ${debugInfo.article.author}
-• URL: ${debugInfo.article.url}
-
-**Verification:**
-• Valid: ${debugInfo.verification.isValid ? 'Yes ✅' : 'No ❌'}
-• Status: ${debugInfo.verification.status || 'N/A'}
-${debugInfo.verification.reason ? `• Reason: ${debugInfo.verification.reason}` : ''}
-
-**Tags:** ${Array.isArray(debugInfo.article.tags) ? debugInfo.article.tags.join(', ') : ''}
-
-**Alternatives:** ${debugInfo.article.alternatives ? debugInfo.article.alternatives.length : 0}
-    `.trim();
-
-        await bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
-    } catch (error) {
-        console.error('Error in /debug:', error);
-        await bot.sendMessage(chatId, '❌ Failed to load debug info.');
-    }
+    await bot.sendMessage(chatId, `🔧 **Debug Info**\n\n• User ID: \`${telegramId}\`\n• Mode: Polling\n• Curator: Two-step (llama-3.3 + compound-mini)`, { parse_mode: 'Markdown' });
 }
 
-/**
- * Handle /pause command - Stop scheduled recommendations
- */
+// ============ /pause, /resume ============
 export async function handlePause(bot, msg) {
-    const chatId = msg.chat.id;
     const telegramId = msg.from.id;
-
-    try {
-        await updateUserScheduleStatus(telegramId, false);
-        await bot.sendMessage(chatId, '⏸️ Scheduled recommendations paused. Use /resume to continue.');
-    } catch (error) {
-        console.error('Error in /pause:', error);
-        await bot.sendMessage(chatId, '❌ Failed to pause.');
-    }
+    await updateUserScheduleStatus(telegramId, false);
+    await bot.sendMessage(msg.chat.id, '⏸️ Scheduled recommendations paused.');
 }
 
-/**
- * Handle /resume command - Resume scheduled recommendations
- */
 export async function handleResume(bot, msg) {
-    const chatId = msg.chat.id;
     const telegramId = msg.from.id;
-
-    try {
-        await updateUserScheduleStatus(telegramId, true);
-        await bot.sendMessage(chatId, '▶️ Scheduled recommendations resumed!');
-    } catch (error) {
-        console.error('Error in /resume:', error);
-        await bot.sendMessage(chatId, '❌ Failed to resume.');
-    }
+    await updateUserScheduleStatus(telegramId, true);
+    await bot.sendMessage(msg.chat.id, '▶️ Scheduled recommendations resumed!');
 }
 
-/**
- * Handle /settag command - Manually set tag weight
- */
+// ============ /settag, /addtag, /removetag, /resettaste ============
 export async function handleSetTag(bot, msg, match) {
     const chatId = msg.chat.id;
     const telegramId = msg.from.id;
-    const input = match[1]; // "TagName 80"
+    const user = await getUser(telegramId);
+    if (!user) return bot.sendMessage(chatId, '❌ Please /start first');
 
-    try {
-        const user = await getUser(telegramId);
-        if (!user) {
-            await bot.sendMessage(chatId, '❌ Please /start first.');
-            return;
-        }
+    const args = match?.[1];
+    if (!args) return bot.sendMessage(chatId, '⚠️ Usage: /settag <Tag Name> <Weight>');
 
-        if (!input) {
-            await bot.sendMessage(chatId, '⚠️ Usage: /settag <TagName> <Weight(0-100)>');
-            return;
-        }
+    const lastSpace = args.lastIndexOf(' ');
+    if (lastSpace === -1) return bot.sendMessage(chatId, '⚠️ Usage: /settag <Tag Name> <Weight>');
 
-        const parts = input.split(' ');
-        const weight = parseInt(parts.pop(), 10);
-        const tag = parts.join(' ');
+    const tag = args.substring(0, lastSpace).trim();
+    const weight = parseInt(args.substring(lastSpace + 1), 10);
 
-        if (isNaN(weight) || weight < 0 || weight > 100) {
-            await bot.sendMessage(chatId, '⚠️ Weight must be a number between 0 and 100.');
-            return;
-        }
+    if (isNaN(weight) || weight < 0 || weight > 100) return bot.sendMessage(chatId, '⚠️ Weight must be 0-100');
 
-        await setUserPreference(user.id, tag, weight / 100); // Normalize to 0-1
-        await bot.sendMessage(chatId, `✅ Set **${tag}** to ${weight}%`, { parse_mode: 'Markdown' });
-
-    } catch (error) {
-        console.error('Error in /settag:', error);
-        await bot.sendMessage(chatId, '❌ Failed to set tag.');
-    }
+    await setUserPreference(user.id, tag, weight);
+    await bot.sendMessage(chatId, `✅ Set **${tag}** to ${weight}%`, { parse_mode: 'Markdown' });
 }
 
-/**
- * Handle /addtag command - Add interest (default 50%)
- */
 export async function handleAddTag(bot, msg, match) {
     const chatId = msg.chat.id;
     const telegramId = msg.from.id;
-    const tag = match[1];
+    const user = await getUser(telegramId);
+    if (!user) return bot.sendMessage(chatId, '❌ Please /start first');
 
-    try {
-        const user = await getUser(telegramId);
-        if (!user) {
-            await bot.sendMessage(chatId, '❌ Please /start first.');
-            return;
-        }
+    const tag = match?.[1];
+    if (!tag) return bot.sendMessage(chatId, '⚠️ Usage: /addtag <Tag Name>');
 
-        if (!tag) {
-            await bot.sendMessage(chatId, '⚠️ Usage: /addtag <TagName>');
-            return;
-        }
-
-        await setUserPreference(user.id, tag, 0.5);
-        await bot.sendMessage(chatId, `✅ Added interest: **${tag}**`, { parse_mode: 'Markdown' });
-
-    } catch (error) {
-        console.error('Error in /addtag:', error);
-        await bot.sendMessage(chatId, '❌ Failed to add tag.');
-    }
+    await setUserPreference(user.id, tag.trim(), 50);
+    await bot.sendMessage(chatId, `✅ Added interest: **${tag.trim()}**`, { parse_mode: 'Markdown' });
 }
 
-/**
- * Handle /removetag command - Remove interest
- */
 export async function handleRemoveTag(bot, msg, match) {
     const chatId = msg.chat.id;
     const telegramId = msg.from.id;
-    const tag = match[1];
+    const user = await getUser(telegramId);
+    if (!user) return bot.sendMessage(chatId, '❌ Please /start first');
 
-    try {
-        const user = await getUser(telegramId);
-        if (!user) {
-            await bot.sendMessage(chatId, '❌ Please /start first.');
-            return;
-        }
+    const tag = match?.[1];
+    if (!tag) return bot.sendMessage(chatId, '⚠️ Usage: /removetag <Tag Name>');
 
-        if (!tag) {
-            await bot.sendMessage(chatId, '⚠️ Usage: /removetag <TagName>');
-            return;
-        }
-
-        await removeUserPreference(user.id, tag);
-        await bot.sendMessage(chatId, `🗑️ Removed interest: **${tag}**`, { parse_mode: 'Markdown' });
-
-    } catch (error) {
-        console.error('Error in /removetag:', error);
-        await bot.sendMessage(chatId, '❌ Failed to remove tag.');
-    }
+    await removeUserPreference(user.id, tag.trim());
+    await bot.sendMessage(chatId, `🗑️ Removed interest: **${tag.trim()}**`, { parse_mode: 'Markdown' });
 }
 
-/**
- * Handle /resettaste command - Reset all preferences
- */
 export async function handleResetTaste(bot, msg) {
     const chatId = msg.chat.id;
     const telegramId = msg.from.id;
+    const user = await getUser(telegramId);
+    if (!user) return bot.sendMessage(chatId, '❌ Please /start first');
 
-    try {
-        const user = await getUser(telegramId);
-        if (!user) return;
-
-        await resetUserPreferences(user.id);
-        await bot.sendMessage(chatId, '🔄 Taste profile reset to defaults.');
-
-    } catch (error) {
-        console.error('Error in /resettaste:', error);
-        await bot.sendMessage(chatId, '❌ Failed to reset taste.');
-    }
+    await resetUserPreferences(user.id);
+    await bot.sendMessage(chatId, '🔄 Taste profile reset. Use /preferences to see defaults.');
 }
