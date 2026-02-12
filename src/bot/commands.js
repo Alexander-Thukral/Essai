@@ -12,27 +12,48 @@ import {
 } from '../services/supabase.js';
 import { generateRecommendation } from '../services/curator.js';
 import { verifyLink } from '../services/linkVerifier.js';
-import { getTopPreferences, formatPreferences } from '../services/tasteLearner.js';
+import { getTopPreferences, formatPreferences, initializeDefaultTags } from '../services/tasteLearner.js';
 
-// ============ /start ============
 export async function handleStart(bot, msg) {
     const chatId = msg.chat.id;
+    const telegramId = msg.from.id;
+    const username = msg.from.username || msg.from.first_name;
+
+    // Create user if not exists
+    const user = await getUser(telegramId) || await createUser(telegramId, username, false);
+
+    // Initialize default preferences if new user
+    let prefs = await getTopPreferences(user.id, 12);
+    if (!prefs.length) {
+        await initializeDefaultTags(user.id);
+        prefs = await getTopPreferences(user.id, 12);
+    }
+
+    // Format preference bars for display
+    const prefDisplay = formatPreferences(prefs.slice(0, 7));
 
     const message = `📚 **Welcome to Essai!**
 
 I'm your personal reading curator. I find intellectually stimulating essays, papers, and articles tailored to your interests.
 
-**Commands:**
+📊 **Your Starting Interests:**
+${prefDisplay}
+
+_All topics start at 50%. As you rate recommendations (⭐1-5), I'll learn what you enjoy!_
+
+**Quick Start:**
+1️⃣ Try /recommend to get your first article
+2️⃣ Rate it ⭐1-5 to teach me your taste
+3️⃣ Use /addtag or /removetag to customize topics
+
+**All Commands:**
 • /recommend - Get a reading recommendation
 • /preferences - See your taste profile
-• /settag \`tag\` \`weight\` - Set a tag weight (0-100)
-• /addtag \`tag\` - Add new interest
-• /removetag \`tag\` - Remove a tag
-• /resettaste - Reset all preferences
-• /pause / /resume - Toggle scheduled pushes
-• /help - Show this list again
-
-Start with /preferences to see your interests, then /recommend!`;
+• /addtag \`topic\` - Add an interest
+• /removetag \`topic\` - Remove an interest  
+• /settag \`topic\` \`0-100\` - Set exact weight
+• /resettaste - Reset to defaults
+• /pause / /resume - Toggle scheduled pushes`;
 
     await bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
 }
@@ -151,14 +172,13 @@ export async function handlePreferences(bot, msg) {
     const user = await getUser(telegramId);
     if (!user) return bot.sendMessage(chatId, '❌ Please /start first');
 
-    let prefs = await getTopPreferences(user.id, 7);
+    let prefs = await getTopPreferences(user.id, 12);
     if (!prefs.length) {
-        const defaults = ['Psychology', 'Philosophy', 'Economics', 'Physics', 'History', 'Essays', 'Game Theory', 'Biology', 'Sociology', 'Mathematics'];
-        for (const tag of defaults) await setUserPreference(user.id, tag, 50);
-        prefs = await getTopPreferences(user.id, 7);
+        await initializeDefaultTags(user.id);
+        prefs = await getTopPreferences(user.id, 12);
     }
-    const format = formatPreferences(prefs);
-    await bot.sendMessage(chatId, `📊 **Your Interests:**\n\n${format}\n\n_Use /settag, /addtag, /removetag to customize_`, { parse_mode: 'Markdown' });
+    const display = formatPreferences(prefs);
+    await bot.sendMessage(chatId, `📊 **Your Interests:**\n\n${display}\n\n_Weights adjust as you rate recommendations ⭐1-5_\n_Use /addtag, /removetag, /settag to customize_`, { parse_mode: 'Markdown' });
 }
 
 // ============ /debug ============

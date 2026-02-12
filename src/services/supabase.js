@@ -189,7 +189,8 @@ export async function updateUserPreference(userId, tag, weightDelta) {
 
     const currentWeight = existing?.weight ?? 50;
     const currentCount = existing?.sample_count ?? 0;
-    const newWeight = Math.max(0, Math.min(100, currentWeight + weightDelta));
+    // ALWAYS clamp to 0-100 to prevent corrupt values
+    const newWeight = Math.max(0, Math.min(100, Math.max(0, Math.min(100, currentWeight)) + weightDelta));
 
     const { error } = await supabase
         .from('user_preferences')
@@ -252,4 +253,44 @@ export async function getScheduledUsers() {
 
     if (error) throw error;
     return data || [];
+}
+
+/**
+ * Cleanup: Clamp all preference weights to 0-100.
+ * Run once to fix any corrupt data from previous bugs.
+ */
+export async function clampAllPreferences() {
+    // Get all preferences with weight outside 0-100
+    const { data: badRows, error: fetchError } = await supabase
+        .from('user_preferences')
+        .select('user_id, tag, weight')
+        .or('weight.gt.100,weight.lt.0');
+
+    if (fetchError) {
+        console.error('Error fetching bad preferences:', fetchError);
+        return { fixed: 0, error: fetchError };
+    }
+
+    if (!badRows || badRows.length === 0) {
+        return { fixed: 0 };
+    }
+
+    console.log(`Found ${badRows.length} corrupt preference rows`);
+    let fixed = 0;
+
+    for (const row of badRows) {
+        const clamped = Math.max(0, Math.min(100, row.weight));
+        const { error } = await supabase
+            .from('user_preferences')
+            .update({ weight: clamped })
+            .eq('user_id', row.user_id)
+            .eq('tag', row.tag);
+
+        if (!error) {
+            fixed++;
+            console.log(`  Fixed: ${row.tag} ${row.weight} → ${clamped}`);
+        }
+    }
+
+    return { fixed, total: badRows.length };
 }

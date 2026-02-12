@@ -1,6 +1,6 @@
 import { updateUserPreference, getUserPreferences, setUserPreference } from './supabase.js';
 
-// Default tags for new users
+// Default tags for new users — curated starting interests
 const DEFAULT_TAGS = [
     'Psychology', 'Philosophy', 'Economics', 'Physics',
     'History', 'Essays', 'Game Theory', 'Biology',
@@ -8,55 +8,45 @@ const DEFAULT_TAGS = [
 ];
 
 /**
- * Calculate taste impact from rating
- * Rating 5 → +4, 4 → +2, 3 → 0, 2 → -2, 1 → -4, 0 → -6
- * @param {number} rating - 0-5 rating
- * @returns {number} weight delta
+ * Calculate taste impact from rating (1-5 scale)
+ * Rating 5 → +4, 4 → +2, 3 → 0 (neutral), 2 → -2, 1 → -4
+ * Skip (0) → not called (handled in caller)
  */
 export function calculateImpact(rating) {
     return (rating - 3) * 2;
 }
 
 /**
- * Initialize default tags for a new user
- * @param {string} userId - Supabase user UUID
+ * Initialize default tags for a new user.
+ * All start at weight 50 (neutral / equal interest).
  */
 export async function initializeDefaultTags(userId) {
     for (const tag of DEFAULT_TAGS) {
         await setUserPreference(userId, tag, 50);
     }
+    return DEFAULT_TAGS.length;
 }
 
 /**
- * Update user preferences based on article rating
- * @param {string} userId - Supabase user UUID
- * @param {string[]} tags - Tags from the rated article
- * @param {number} rating - 0-5 rating
- * @returns {Promise<void>}
+ * Update user preferences based on article rating.
+ * Called after a user rates a recommendation 1-5.
  */
 export async function updateTasteFromRating(userId, tags, rating) {
     const impact = calculateImpact(rating);
+    if (impact === 0) return; // Neutral rating = no change
 
-    // Skip neutral ratings
-    if (impact === 0) return;
-
-    // Update each tag
     for (const tag of tags) {
         await updateUserPreference(userId, tag, impact);
     }
 }
 
 /**
- * Get top N preferences for display
- * If user has no preferences, initialize defaults first
- * @param {string} userId - Supabase user UUID
- * @param {number} limit - Number of top preferences to return
- * @returns {Promise<Array<{tag: string, weight: number}>>}
+ * Get top N preferences for a user.
+ * If user has no preferences, initialize defaults first.
  */
-export async function getTopPreferences(userId, limit = 5) {
+export async function getTopPreferences(userId, limit = 7) {
     let prefs = await getUserPreferences(userId);
 
-    // If no preferences, initialize defaults
     if (!prefs.length) {
         await initializeDefaultTags(userId);
         prefs = await getUserPreferences(userId);
@@ -66,30 +56,31 @@ export async function getTopPreferences(userId, limit = 5) {
 }
 
 /**
- * Format preferences for display
- * @param {Array<{tag: string, weight: number}>} preferences
- * @returns {string}
+ * Format preferences for Telegram display.
+ * Weights are 0-100 scale, displayed as a visual bar.
+ * Always clamps to valid range for display safety.
  */
 export function formatPreferences(preferences) {
     if (!preferences.length) {
-        return '📊 No taste profile yet. Use /addtag to add interests!';
+        return '_No interests set yet. Use /addtag to add topics!_';
     }
 
     const lines = preferences.map((p, i) => {
-        const bar = getWeightBar(p.weight);
-        return `${i + 1}. **${p.tag}** ${bar} ${Math.round(p.weight)}%`;
+        // ALWAYS clamp to 0-100 for display (safety against corrupt DB values)
+        const weight = Math.max(0, Math.min(100, Math.round(p.weight)));
+        const bar = getWeightBar(weight);
+        return `${i + 1}. **${p.tag}** ${bar} ${weight}%`;
     });
 
-    return `📊 **Your Interests:**\n\n${lines.join('\n')}\n\n_Use /settag, /addtag, /removetag to customize_`;
+    return lines.join('\n');
 }
 
 /**
- * Generate a visual bar for weight
- * @param {number} weight - 0-100 weight
- * @returns {string}
+ * Generate a visual bar for weight (0-100 → 0-10 blocks)
  */
 function getWeightBar(weight) {
-    const filled = Math.round(weight / 10);
+    const clamped = Math.max(0, Math.min(100, weight));
+    const filled = Math.round(clamped / 10);
     const empty = 10 - filled;
     return '█'.repeat(filled) + '░'.repeat(empty);
 }

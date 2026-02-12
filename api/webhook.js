@@ -173,7 +173,8 @@ async function updateUserPreference(userId, tag, weightDelta) {
         .single();
     const currentWeight = existing?.weight ?? 50;
     const currentCount = existing?.sample_count ?? 0;
-    const newWeight = Math.max(0, Math.min(100, currentWeight + weightDelta));
+    // Clamp current weight first (fix corrupt data), then apply delta
+    const newWeight = Math.max(0, Math.min(100, Math.max(0, Math.min(100, currentWeight)) + weightDelta));
     const { error } = await supabase
         .from('user_preferences')
         .upsert({
@@ -440,23 +441,48 @@ async function verifyLink(url, expectedTitle = '') {
 
 // ============ COMMAND HANDLERS ============
 async function handleStart(chatId, telegramId, username) {
-    await createUser(telegramId, username, telegramId === config.telegram.ownerId);
+    const user = await createUser(telegramId, username, telegramId === config.telegram.ownerId);
+
+    // Initialize default preferences if new user
+    const defaultTags = ['Psychology', 'Philosophy', 'Economics', 'Physics', 'History', 'Essays', 'Game Theory', 'Biology', 'Sociology', 'Mathematics', 'Computer Science', 'Geopolitics'];
+    let prefs = await getTopPreferences(user.id, 12);
+    if (!prefs.length) {
+        for (const tag of defaultTags) await setUserPreference(user.id, tag, 50);
+        prefs = await getTopPreferences(user.id, 12);
+    }
+
+    // Format preference bars for display
+    const getBar = (w) => {
+        const clamped = Math.max(0, Math.min(100, Math.round(w)));
+        return '█'.repeat(Math.round(clamped / 10)) + '░'.repeat(10 - Math.round(clamped / 10));
+    };
+    const prefList = prefs.slice(0, 7).map((p, i) => {
+        const w = Math.max(0, Math.min(100, Math.round(p.weight)));
+        return `${i + 1}. **${p.tag}** ${getBar(w)} ${w}%`;
+    }).join('\n');
 
     const message = `📚 **Welcome to Essai!**
 
 I'm your personal reading curator. I find intellectually stimulating essays, papers, and articles tailored to your interests.
 
-**Commands:**
+📊 **Your Starting Interests:**
+${prefList}
+
+_All topics start at 50%. As you rate recommendations (⭐1-5), I'll learn what you enjoy!_
+
+**Quick Start:**
+1️⃣ Try /recommend to get your first article
+2️⃣ Rate it ⭐1-5 to teach me your taste
+3️⃣ Use /addtag or /removetag to customize topics
+
+**All Commands:**
 • /recommend - Get a reading recommendation
 • /preferences - See your taste profile
-• /settag \`tag\` \`weight\` - Set a tag weight (0-100)
-• /addtag \`tag\` - Add new interest
-• /removetag \`tag\` - Remove a tag
-• /resettaste - Reset all preferences
-• /pause / /resume - Toggle scheduled pushes
-• /help - Show this list again
-
-Start with /preferences to see your interests, then /recommend!`;
+• /addtag \`topic\` - Add an interest
+• /removetag \`topic\` - Remove an interest  
+• /settag \`topic\` \`0-100\` - Set exact weight
+• /resettaste - Reset to defaults
+• /pause / /resume - Toggle scheduled pushes`;
 
     await bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
 }
@@ -576,16 +602,21 @@ async function handleRecommend(chatId, telegramId, user) {
 }
 
 async function handlePreferences(chatId, userId) {
-    let prefs = await getTopPreferences(userId, 7);
+    let prefs = await getTopPreferences(userId, 12);
     if (!prefs.length) {
-        // Initialize defaults
-        const defaults = ['Psychology', 'Philosophy', 'Economics', 'Physics', 'History', 'Essays', 'Game Theory', 'Biology', 'Sociology', 'Mathematics'];
+        const defaults = ['Psychology', 'Philosophy', 'Economics', 'Physics', 'History', 'Essays', 'Game Theory', 'Biology', 'Sociology', 'Mathematics', 'Computer Science', 'Geopolitics'];
         for (const tag of defaults) await setUserPreference(userId, tag, 50);
-        prefs = await getTopPreferences(userId, 7);
+        prefs = await getTopPreferences(userId, 12);
     }
-    const getBar = (w) => '█'.repeat(Math.round(w / 10)) + '░'.repeat(10 - Math.round(w / 10));
-    const list = prefs.map((p, i) => `${i + 1}. **${p.tag}** ${getBar(p.weight)} ${Math.round(p.weight)}%`).join('\n');
-    await bot.sendMessage(chatId, `📊 **Your Interests:**\n\n${list}\n\n_Use /settag, /addtag, /removetag to customize_`, { parse_mode: 'Markdown' });
+    const getBar = (w) => {
+        const clamped = Math.max(0, Math.min(100, Math.round(w)));
+        return '█'.repeat(Math.round(clamped / 10)) + '░'.repeat(10 - Math.round(clamped / 10));
+    };
+    const list = prefs.map((p, i) => {
+        const w = Math.max(0, Math.min(100, Math.round(p.weight)));
+        return `${i + 1}. **${p.tag}** ${getBar(w)} ${w}%`;
+    }).join('\n');
+    await bot.sendMessage(chatId, `📊 **Your Interests:**\n\n${list}\n\n_Weights adjust as you rate recommendations ⭐1-5_\n_Use /addtag, /removetag, /settag to customize_`, { parse_mode: 'Markdown' });
 }
 
 async function handleSetTag(chatId, userId, args) {
