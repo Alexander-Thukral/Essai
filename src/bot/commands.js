@@ -131,8 +131,8 @@ export async function handleRecommend(bot, msg) {
         message += `\n\n${tags}`;
         message += `\n\n🔗 [Read](${deliveredArticle.url}) ${statusEmoji}${statusNote}`;
 
-        // Add alternatives
-        if (deliveredArticle.alternatives?.length > 0) {
+        // Add alternatives - ONLY if we couldn't verify the primary/delivered article
+        if (!deliveredVerification.isValid && deliveredArticle.alternatives?.length > 0) {
             message += `\n\n📚 **Also recommended:**`;
             deliveredArticle.alternatives.forEach(r => {
                 const altEmoji = r.is_search_fallback ? '🔎' : '';

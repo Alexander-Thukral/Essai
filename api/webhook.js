@@ -626,8 +626,9 @@ async function handleRecommend(chatId, telegramId, user) {
         message += `\n\n${tags}`;
         message += `\n\n🔗 [Read](${deliveredArticle.url}) ${statusEmoji}${statusNote}`;
 
-        // Add alternatives
-        if (deliveredArticle.alternatives?.length > 0) {
+        // Add alternatives - ONLY if we couldn't verify the primary/delivered article
+        // User requested to remove alternates if primary is verified to avoid broken links
+        if (!deliveredVerification.isValid && deliveredArticle.alternatives?.length > 0) {
             message += `\n\n📚 **Also recommended:**`;
             deliveredArticle.alternatives.forEach(r => {
                 const altEmoji = r.is_search_fallback ? '🔎' : '';
